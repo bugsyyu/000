@@ -39,6 +39,11 @@ def find_shortest_paths(
     # Create a graph from nodes and edges
     G = nx.Graph()
 
+    # 修复: 首先添加所有节点，包括没有边的节点
+    # 这样确保所有的起始点和终点都存在于图中
+    for i in range(len(nodes)):
+        G.add_node(i)
+
     # Add weighted edges
     for i, j in edges:
         weight = distance_point_to_point(nodes[i], nodes[j])
@@ -51,15 +56,27 @@ def find_shortest_paths(
     for start_idx in start_indices:
         for end_idx in end_indices:
             try:
-                path = nx.shortest_path(G, source=start_idx, target=end_idx, weight='weight')
-                paths.append(path)
-                success_flags.append(True)
+                # 检查起点和终点是否有连通路径
+                if nx.has_path(G, source=start_idx, target=end_idx):
+                    path = nx.shortest_path(G, source=start_idx, target=end_idx, weight='weight')
+                    paths.append(path)
+                    success_flags.append(True)
+                else:
+                    # 没有路径
+                    paths.append([])
+                    success_flags.append(False)
             except nx.NetworkXNoPath:
                 # No path exists
                 paths.append([])
                 success_flags.append(False)
+            except nx.NodeNotFound as e:
+                # 节点不存在 (这不应该发生，因为我们已经确保添加了所有节点)
+                print(f"Warning: Node not found in graph: {e}")
+                paths.append([])
+                success_flags.append(False)
 
     return paths, success_flags
+
 
 def check_adi_zone_traversal(
     path: List[int],
@@ -291,12 +308,13 @@ def evaluate_network(
 
     return results
 
+
 def extract_features_for_gnn(
-    nodes: np.ndarray,
-    node_types: List[int],
-    edges: List[Tuple[int, int]],
-    adi_zones: List[Dict],
-    danger_zones: List[Dict]
+        nodes: np.ndarray,
+        node_types: List[int],
+        edges: List[Tuple[int, int]],
+        adi_zones: List[Dict],
+        danger_zones: List[Dict]
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Extract features for graph neural network.
@@ -313,8 +331,13 @@ def extract_features_for_gnn(
     """
     num_nodes = len(nodes)
 
-    # Node features: [x, y, type_onehot[4], distances_to_adi_zones[3]]
-    node_features = np.zeros((num_nodes, 2 + 4 + len(adi_zones)))
+    # 确定节点类型的最大值，用于one-hot编码
+    max_node_type = max(node_types)
+    unique_node_types = max_node_type + 1  # 0到max_node_type的数量
+
+    # 修复: 调整节点特征维度，确保one-hot编码与节点类型匹配
+    # node_features: [x, y, type_onehot[unique_node_types], distances_to_adi_zones[len(adi_zones)]]
+    node_features = np.zeros((num_nodes, 2 + unique_node_types + len(adi_zones)))
 
     # Copy coordinates
     node_features[:, 0:2] = nodes
@@ -333,19 +356,19 @@ def extract_features_for_gnn(
 
             # Normalize by outer radius
             normalized_distance = distance / zone['epsilon']
-            node_features[i, 6 + j] = normalized_distance
+            node_features[i, 2 + unique_node_types + j] = normalized_distance
 
     # Edge indices and features
     if not edges:
         # Return empty arrays if no edges
         edge_indices = np.zeros((2, 0), dtype=np.int64)
-        edge_features = np.zeros((0, 3 + len(adi_zones)))
+        edge_features = np.zeros((0, 1 + len(adi_zones) + 1))
         return node_features, edge_indices, edge_features
 
     # Edge indices: [2, num_edges]
     edge_indices = np.array([[e[0], e[1]] for e in edges], dtype=np.int64).T
 
-    # Edge features: [length, crosses_adi_outer[3], danger_penalty]
+    # Edge features: [length, crosses_adi_outer[len(adi_zones)], danger_penalty]
     edge_features = np.zeros((len(edges), 1 + len(adi_zones) + 1))
 
     for e_idx, (i, j) in enumerate(edges):

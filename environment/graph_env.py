@@ -85,7 +85,12 @@ class GraphConstructionEnv(gym.Env):
         # - 'edge_features': [num_edges, edge_feature_dim]
         # - 'valid_mask': [num_potential_edges]
 
-        node_feature_dim = 2 + 4 + len(self.adi_zones)  # x, y, type_onehot[4], distances_to_adi
+        # 修复: 使node_feature_dim匹配extract_features_for_gnn中的实际维度
+        # 修改前: node_feature_dim = 2 + 4 + len(self.adi_zones)
+        # 查看node_types中的类型取值范围，确保one-hot编码维度正确
+        unique_node_types = len(set(node_types))
+        node_feature_dim = 2 + unique_node_types + len(self.adi_zones)  # x, y, type_onehot, distances_to_adi
+
         edge_feature_dim = 1 + len(self.adi_zones) + 1  # length, crosses_adi_outer[3], danger
 
         self.observation_space = spaces.Dict({
