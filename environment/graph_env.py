@@ -42,16 +42,16 @@ class GraphConstructionEnv(gym.Env):
     metadata = {'render.modes': ['human']}
 
     def __init__(
-        self,
-        nodes: np.ndarray,
-        node_types: List[int],
-        adi_zones: List[Dict],
-        danger_zones: List[Dict],
-        frontline_indices: List[int],
-        airport_indices: List[int],
-        max_edges: int = 100,
-        max_angle_deg: float = 80.0,
-        render_mode: str = None
+            self,
+            nodes: np.ndarray,
+            node_types: List[int],
+            adi_zones: List[Dict],
+            danger_zones: List[Dict],
+            frontline_indices: List[int],
+            airport_indices: List[int],
+            max_edges: int = 100,
+            max_angle_deg: float = 80.0,
+            render_mode: str = None
     ):
         super(GraphConstructionEnv, self).__init__()
 
@@ -88,11 +88,12 @@ class GraphConstructionEnv(gym.Env):
         # 修复: 使node_feature_dim匹配extract_features_for_gnn中的实际维度
         # 修改前: node_feature_dim = 2 + 4 + len(self.adi_zones)
         # 查看node_types中的类型取值范围，确保one-hot编码维度正确
-        unique_node_types = len(set(node_types))
+        unique_node_types = max(node_types) + 1
         node_feature_dim = 2 + unique_node_types + len(self.adi_zones)  # x, y, type_onehot, distances_to_adi
 
         edge_feature_dim = 1 + len(self.adi_zones) + 1  # length, crosses_adi_outer[3], danger
 
+        # 修改 observation_space 定义
         self.observation_space = spaces.Dict({
             'node_features': spaces.Box(
                 low=-np.inf,
@@ -115,7 +116,7 @@ class GraphConstructionEnv(gym.Env):
             'valid_mask': spaces.Box(
                 low=0,
                 high=1,
-                shape=(self.num_nodes * self.num_nodes,),  # Upper bound, will be smaller in practice
+                shape=(self.num_nodes * self.num_nodes,),  # 一维展开的邻接矩阵大小
                 dtype=bool
             )
         })
@@ -303,9 +304,14 @@ class GraphConstructionEnv(gym.Env):
             padded_edge_indices = edge_indices
             padded_edge_features = edge_features
 
-        # Create valid action mask
-        valid_mask = np.zeros(len(self.valid_potential_edges), dtype=bool)
-        valid_mask[:] = True
+        # 修改：创建与观察空间大小一致的掩码数组
+        valid_mask = np.zeros(self.num_nodes * self.num_nodes, dtype=bool)
+
+        # 将每个有效边的索引设置为 True
+        for i, j in self.valid_potential_edges:
+            # 将二维索引(i,j)转换为一维索引
+            idx = i * self.num_nodes + j
+            valid_mask[idx] = True
 
         # Create the observation dictionary
         obs = {
@@ -316,7 +322,6 @@ class GraphConstructionEnv(gym.Env):
         }
 
         return obs
-
     def _update_valid_potential_edges(self):
         """
         Update the list of valid potential edges.

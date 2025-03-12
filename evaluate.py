@@ -134,7 +134,7 @@ def evaluate_network_plan(
         lat, lon = cartesian_to_lat_lon(node[0], node[1], ref_lat, ref_lon)
         geo_nodes.append((lat, lon))
 
-    # Save geojson format
+    # Save geojson format - 修改这部分以处理NumPy类型
     geojson = {
         'type': 'FeatureCollection',
         'features': []
@@ -142,17 +142,17 @@ def evaluate_network_plan(
 
     # Add nodes
     for i, (lat, lon) in enumerate(geo_nodes):
-        node_type = node_types[i]
+        node_type = int(node_types[i])  # 转换为标准 Python int
         node_type_str = ['frontline', 'airport', 'common', 'outlier'][node_type]
 
         geojson['features'].append({
             'type': 'Feature',
             'geometry': {
                 'type': 'Point',
-                'coordinates': [lon, lat]
+                'coordinates': [float(lon), float(lat)]  # 转换为标准 Python float
             },
             'properties': {
-                'id': i,
+                'id': int(i),  # 转换为标准 Python int
                 'type': node_type_str
             }
         })
@@ -164,13 +164,13 @@ def evaluate_network_plan(
             'geometry': {
                 'type': 'LineString',
                 'coordinates': [
-                    [geo_nodes[i][1], geo_nodes[i][0]],
-                    [geo_nodes[j][1], geo_nodes[j][0]]
+                    [float(geo_nodes[i][1]), float(geo_nodes[i][0])],  # 转换为标准 Python float
+                    [float(geo_nodes[j][1]), float(geo_nodes[j][0])]  # 转换为标准 Python float
                 ]
             },
             'properties': {
-                'from_node': i,
-                'to_node': j
+                'from_node': int(i),  # 转换为标准 Python int
+                'to_node': int(j)  # 转换为标准 Python int
             }
         })
 
@@ -180,20 +180,31 @@ def evaluate_network_plan(
             'type': 'Feature',
             'geometry': {
                 'type': 'Point',
-                'coordinates': [zone['original_lon'], zone['original_lat']]
+                'coordinates': [float(zone['original_lon']), float(zone['original_lat'])]  # 转换为标准 Python float
             },
             'properties': {
                 'type': 'adi_zone',
-                'id': i,
-                'inner_radius': zone['radius'],
-                'outer_radius': zone['epsilon'],
-                'weapon_type': zone['weapon_type']
+                'id': int(i),  # 转换为标准 Python int
+                'inner_radius': float(zone['radius']),  # 转换为标准 Python float
+                'outer_radius': float(zone['epsilon']),  # 转换为标准 Python float
+                'weapon_type': str(zone['weapon_type'])  # 确保字符串类型
             }
         })
 
+    # 使用自定义编码器保存 geojson
+    class NumpyEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return super(NumpyEncoder, self).default(obj)
+
     # Save geojson
     with open(os.path.join(output_dir, 'network_plan.geojson'), 'w') as f:
-        json.dump(geojson, f, indent=2)
+        json.dump(geojson, f, indent=2, cls=NumpyEncoder)  # 使用自定义编码器
 
 
 def main():

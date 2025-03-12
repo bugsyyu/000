@@ -110,10 +110,10 @@ class GraphConstructionActorHead(nn.Module):
         )
 
     def forward(
-        self,
-        node_embeddings: torch.Tensor,
-        valid_edges: List[Tuple[int, int]],
-        valid_mask: torch.Tensor
+            self,
+            node_embeddings: torch.Tensor,
+            valid_edges: List[Tuple[int, int]],
+            valid_mask: torch.Tensor
     ) -> torch.Tensor:
         """
         Forward pass through the actor head.
@@ -126,28 +126,24 @@ class GraphConstructionActorHead(nn.Module):
         Returns:
             Edge selection logits of shape [num_valid_edges]
         """
-        if not valid_edges:
-            # No valid edges, return empty tensor
-            return torch.zeros(0, dtype=torch.float32, device=node_embeddings.device)
+        # 修改为使用完整掩码而不是边的列表
+        num_nodes = node_embeddings.shape[0]
+        edge_scores = torch.zeros(num_nodes * num_nodes, device=node_embeddings.device)
 
-        # Get edge embeddings
-        edge_embeddings = []
-        for i, j in valid_edges:
-            # Concatenate node embeddings
-            edge_emb = torch.cat([node_embeddings[i], node_embeddings[j]], dim=0)
-            edge_embeddings.append(edge_emb)
+        # 仅为有效操作计算分数
+        for i in range(num_nodes):
+            for j in range(num_nodes):
+                if i != j:  # 避免自环
+                    idx = i * num_nodes + j
+                    if valid_mask[idx]:
+                        # 拼接节点嵌入
+                        edge_emb = torch.cat([node_embeddings[i], node_embeddings[j]], dim=0)
+                        # 计算单个边的分数
+                        score = self.edge_scorer(edge_emb.unsqueeze(0)).squeeze(-1)
+                        edge_scores[idx] = score
 
-        if not edge_embeddings:
-            return torch.zeros(0, dtype=torch.float32, device=node_embeddings.device)
-
-        edge_embeddings = torch.stack(edge_embeddings, dim=0)
-
-        # Score edges
-        edge_scores = self.edge_scorer(edge_embeddings).squeeze(-1)
-
-        # Apply mask
-        if valid_mask is not None and len(valid_mask) > 0:
-            edge_scores = edge_scores * valid_mask
+        # 屏蔽无效操作
+        edge_scores = edge_scores * valid_mask
 
         return edge_scores
 
