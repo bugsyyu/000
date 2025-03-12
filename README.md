@@ -29,3 +29,22 @@ airspace_network_planning/
 
 
 ```
+
+
+## 使用指导
+
+1. **使用训练脚本**：
+   ```bash
+   python train.py --output_dir ./output --node_timesteps 1000 --graph_timesteps 1000 --n_envs 1
+   ```
+
+2. **或者使用快速测试脚本**：
+   ```bash
+   python train_quick.py --output_dir ./quick_output --test_env
+   ```
+
+3. **评估生成的网络**：
+   ```bash
+   python evaluate.py --input_file ./output/final_network.npz --output_dir ./evaluation
+   ```
+
