@@ -58,6 +58,13 @@ def plot_airspace_network(
         circle = Circle(center, radius, fill=True, color=color)
         ax.add_patch(circle)
 
+    # Plot airport no-fly zones (20km radius)
+    for i, node_type in enumerate(node_types):
+        if node_type == 1:  # Airport
+            airport_point = tuple(nodes[i])
+            no_fly_circle = Circle(airport_point, 20.0, fill=True, alpha=0.3, color='orange')
+            ax.add_patch(no_fly_circle)
+
     # Create a graph for edges
     G = nx.Graph()
 
@@ -136,8 +143,9 @@ def plot_airspace_network(
     inner_adi = plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='red', alpha=0.5, markersize=10, label='Inner ADI (No-Fly)')
     outer_adi = plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='blue', alpha=0.2, markersize=10, label='Outer ADI (Recognition)')
     danger = plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='red', alpha=0.3, markersize=10, label='Danger Zone')
+    airport_no_fly = plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='orange', alpha=0.3, markersize=10, label='Airport No-Fly Zone (20km)')
 
-    plt.legend(handles=[frontline, airport, common, outlier, inner_adi, outer_adi, danger], loc='upper right')
+    plt.legend(handles=[frontline, airport, common, outlier, inner_adi, outer_adi, danger, airport_no_fly], loc='upper right')
 
     plt.tight_layout()
 
@@ -212,16 +220,18 @@ def plot_training_progress(
 
     return fig, axs
 
+
 def plot_paths_between_points(
-    nodes: np.ndarray,
-    edges: List[Tuple[int, int]],
-    paths: List[List[int]],
-    start_indices: List[int],
-    end_indices: List[int],
-    adi_zones: List[Dict],
-    danger_zones: List[Dict],
-    figsize: Tuple[int, int] = (12, 10),
-    title: str = "Paths Between Points"
+        nodes: np.ndarray,
+        edges: List[Tuple[int, int]],
+        paths: List[List[int]],
+        start_indices: List[int],
+        end_indices: List[int],
+        adi_zones: List[Dict],
+        danger_zones: List[Dict],
+        node_types: List[int] = None,  # 新增：节点类型
+        figsize: Tuple[int, int] = (12, 10),
+        title: str = "Paths Between Points"
 ):
     """
     Plot paths between specific points in the network.
@@ -234,6 +244,7 @@ def plot_paths_between_points(
         end_indices: List of end node indices
         adi_zones: List of ADI zone parameters
         danger_zones: List of danger zone parameters
+        node_types: List of node types (0: frontline, 1: airport, 2: common, 3: outlier)
         figsize: Figure size
         title: Plot title
     """
@@ -264,6 +275,14 @@ def plot_paths_between_points(
         circle = Circle(center, radius, fill=True, color=color)
         ax.add_patch(circle)
 
+    # Plot airport no-fly zones (20km radius), if node_types provided
+    if node_types is not None:
+        for i, node_type in enumerate(node_types):
+            if node_type == 1:  # Airport
+                airport_point = tuple(nodes[i])
+                no_fly_circle = Circle(airport_point, 20.0, fill=True, alpha=0.3, color='orange')
+                ax.add_patch(no_fly_circle)
+
     # Create a graph for all edges
     G = nx.Graph()
 
@@ -288,9 +307,9 @@ def plot_paths_between_points(
         # Create a path graph
         P = nx.Graph()
         for j in range(len(path) - 1):
-            P.add_edge(path[j], path[j+1])
+            P.add_edge(path[j], path[j + 1])
             P.nodes[path[j]]['pos'] = pos[path[j]]
-            P.nodes[path[j+1]]['pos'] = pos[path[j+1]]
+            P.nodes[path[j + 1]]['pos'] = pos[path[j + 1]]
 
         pos_P = nx.get_node_attributes(P, 'pos')
 
@@ -302,18 +321,18 @@ def plot_paths_between_points(
     end_nodes = [nodes[i] for i in end_indices]
 
     ax.scatter([n[0] for n in start_nodes], [n[1] for n in start_nodes],
-              color='green', s=100, label='Start Points')
+               color='green', s=100, label='Start Points')
     ax.scatter([n[0] for n in end_nodes], [n[1] for n in end_nodes],
-              color='blue', s=100, label='End Points')
+               color='blue', s=100, label='End Points')
 
     # Add labels for start and end nodes
     for i, idx in enumerate(start_indices):
         ax.annotate(f'S{i}', (nodes[idx][0], nodes[idx][1]),
-                   xytext=(5, 5), textcoords='offset points')
+                    xytext=(5, 5), textcoords='offset points')
 
     for i, idx in enumerate(end_indices):
         ax.annotate(f'E{i}', (nodes[idx][0], nodes[idx][1]),
-                   xytext=(5, 5), textcoords='offset points')
+                    xytext=(5, 5), textcoords='offset points')
 
     # Set plot limits with some padding
     x_coords = [node[0] for node in nodes]
@@ -329,13 +348,25 @@ def plot_paths_between_points(
     plt.ylabel('Y (km)')
 
     # Add a legend
-    start_point = plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='green', markersize=10, label='Start Points')
+    start_point = plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='green', markersize=10,
+                             label='Start Points')
     end_point = plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', markersize=10, label='End Points')
-    inner_adi = plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='red', alpha=0.5, markersize=10, label='Inner ADI (No-Fly)')
-    outer_adi = plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='blue', alpha=0.2, markersize=10, label='Outer ADI (Recognition)')
-    danger = plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='red', alpha=0.3, markersize=10, label='Danger Zone')
+    inner_adi = plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='red', alpha=0.5, markersize=10,
+                           label='Inner ADI (No-Fly)')
+    outer_adi = plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='blue', alpha=0.2, markersize=10,
+                           label='Outer ADI (Recognition)')
+    danger = plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='red', alpha=0.3, markersize=10,
+                        label='Danger Zone')
 
-    plt.legend(handles=[start_point, end_point, inner_adi, outer_adi, danger], loc='upper right')
+    legend_handles = [start_point, end_point, inner_adi, outer_adi, danger]
+
+    # 如果有节点类型，添加机场禁飞区图例
+    if node_types is not None:
+        airport_no_fly = plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='orange', alpha=0.3, markersize=10,
+                                    label='Airport No-Fly Zone (20km)')
+        legend_handles.append(airport_no_fly)
+
+    plt.legend(handles=legend_handles, loc='upper right')
 
     plt.tight_layout()
 

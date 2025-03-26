@@ -188,6 +188,8 @@ class GraphConstructionEnv(gym.Env):
             self.adi_zones,
             self.edges,
             self.nodes,
+            self.node_types,  # 传递节点类型
+            self.airport_indices,  # 传递机场索引
             self.max_angle_deg
         )
 
@@ -322,6 +324,7 @@ class GraphConstructionEnv(gym.Env):
         }
 
         return obs
+
     def _update_valid_potential_edges(self):
         """
         Update the list of valid potential edges.
@@ -335,17 +338,41 @@ class GraphConstructionEnv(gym.Env):
                 if (i, j) in self.edges or (j, i) in self.edges:
                     continue
 
+                # 约束1和2：禁止前沿点之间或机场之间直接连线
+                if (i in self.frontline_indices and j in self.frontline_indices) or \
+                        (i in self.airport_indices and j in self.airport_indices):
+                    continue
+
                 # Extract node coordinates
                 start_point = tuple(self.nodes[i])
                 end_point = tuple(self.nodes[j])
 
-                # Check if the edge is valid
+                # 约束3：检查是否穿过机场禁飞区
+                airport_valid = True
+                for airport_idx in self.airport_indices:
+                    # 跳过如果起点或终点就是机场本身
+                    if i == airport_idx or j == airport_idx:
+                        continue
+
+                    airport_point = tuple(self.nodes[airport_idx])
+                    airport_no_fly_zone = (airport_point, 20.0)  # 20km半径
+
+                    if does_line_cross_circle((start_point, end_point), airport_no_fly_zone):
+                        airport_valid = False
+                        break
+
+                if not airport_valid:
+                    continue
+
+                # Check if the edge is valid for other constraints
                 is_valid, _, _ = is_line_segment_valid(
                     start_point,
                     end_point,
                     self.adi_zones,
                     self.edges,
                     self.nodes,
+                    self.node_types,  # 传递节点类型
+                    self.airport_indices,  # 传递机场索引
                     self.max_angle_deg
                 )
 

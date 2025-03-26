@@ -119,6 +119,7 @@ def evaluate_network_plan(
             end_indices=sample_end_indices,
             adi_zones=cartesian_config['adi_zones'],
             danger_zones=cartesian_config['danger_zones'],
+            node_types=node_types,  # 添加这一行
             title=f'Paths for ADI Traversal Pattern {i + 1}'
         )
 

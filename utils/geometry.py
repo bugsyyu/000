@@ -292,13 +292,16 @@ def get_danger_zone_penalty(line: Tuple[Tuple[float, float], Tuple[float, float]
 
     return total_penalty
 
+
 def is_line_segment_valid(
-    start: Tuple[float, float],
-    end: Tuple[float, float],
-    adi_zones: List[Dict],
-    existing_edges: List[Tuple[int, int]],
-    nodes: np.ndarray,
-    max_angle_deg: float = 80.0
+        start: Tuple[float, float],
+        end: Tuple[float, float],
+        adi_zones: List[Dict],
+        existing_edges: List[Tuple[int, int]],
+        nodes: np.ndarray,
+        node_types: List[int],  # 新增：需要节点类型信息
+        airport_indices: List[int],  # 新增：机场索引列表
+        max_angle_deg: float = 80.0
 ) -> Tuple[bool, str, float]:
     """
     Check if a line segment is valid according to all constraints.
@@ -309,6 +312,8 @@ def is_line_segment_valid(
         adi_zones: List of ADI zone parameters
         existing_edges: List of existing edges as (node1_idx, node2_idx)
         nodes: Array of node coordinates
+        node_types: List of node types (0: frontline, 1: airport, 2: common, 3: outlier)
+        airport_indices: List of airport node indices
         max_angle_deg: Maximum allowed angle in degrees
 
     Returns:
@@ -316,19 +321,7 @@ def is_line_segment_valid(
     """
     line = (start, end)
 
-    # Check if line crosses any inner ADI zones (forbidden)
-    for zone in adi_zones:
-        crosses_inner, crosses_outer = does_line_cross_adi_zone(line, zone)
-
-        if crosses_inner:
-            return False, "Crosses inner ADI zone", 0.0
-
-        # Check for zigzag paths in outer ring
-        if crosses_outer:
-            if does_line_intersect_multiple_segments_in_outer_ring(line, zone, existing_edges, nodes):
-                return False, "Creates zigzag in outer ADI ring", 0.0
-
-    # Check angle constraints with existing segments
+    # 找到起点和终点的索引
     start_idx = None
     end_idx = None
 
@@ -338,40 +331,77 @@ def is_line_segment_valid(
         if np.allclose(node, end):
             end_idx = i
 
+    if start_idx is None or end_idx is None:
+        return False, "无法找到起点或终点索引", 0.0
+
+    # 约束1和2：禁止前沿点之间或机场之间直接连线
+    if (node_types[start_idx] == 0 and node_types[end_idx] == 0):
+        return False, "前沿点之间禁止直接连线", 0.0
+
+    if (node_types[start_idx] == 1 and node_types[end_idx] == 1):
+        return False, "机场之间禁止直接连线", 0.0
+
+    # 约束3：机场周围20km范围内是禁飞区
+    for airport_idx in airport_indices:
+        airport_point = tuple(nodes[airport_idx])
+
+        # 跳过如果起点或终点就是机场本身
+        if start_idx == airport_idx or end_idx == airport_idx:
+            continue
+
+        # 检查线段是否穿过机场的20km禁飞区
+        airport_no_fly_zone = (airport_point, 20.0)  # 20km半径
+
+        if does_line_cross_circle(line, airport_no_fly_zone):
+            return False, f"线段穿过机场{airport_idx}的禁飞区", 0.0
+
+    # 检查是否穿过任何内部ADI区域（禁止）
+    for zone in adi_zones:
+        crosses_inner, crosses_outer = does_line_cross_adi_zone(line, zone)
+
+        if crosses_inner:
+            return False, "穿过内部ADI区域", 0.0
+
+        # 检查是否在外环形成之字形路径
+        if crosses_outer:
+            if does_line_intersect_multiple_segments_in_outer_ring(line, zone, existing_edges, nodes):
+                return False, "在外部ADI环形成之字形路径", 0.0
+
+    # 检查与现有线段的角度约束
     if start_idx is not None:
-        # Check angles with existing edges from start point
+        # 检查与从起点出发的现有边的角度
         for edge in existing_edges:
             if start_idx in edge:
                 other_idx = edge[0] if edge[1] == start_idx else edge[1]
                 other_point = tuple(nodes[other_idx])
 
-                if other_point != end:  # Avoid checking the proposed edge itself
+                if other_point != end:  # 避免检查提议的边本身
                     line1 = (other_point, start)
                     line2 = (start, end)
                     try:
                         angle = angle_between_lines(line1, line2)
                         if angle < max_angle_deg:
-                            return False, f"Angle too sharp ({angle:.1f}°)", 0.0
+                            return False, f"角度过小 ({angle:.1f}°)", 0.0
                     except ValueError:
-                        # Skip if the lines don't share an endpoint
+                        # 如果线没有共享端点则跳过
                         pass
 
     if end_idx is not None:
-        # Check angles with existing edges from end point
+        # 检查与从终点出发的现有边的角度
         for edge in existing_edges:
             if end_idx in edge:
                 other_idx = edge[0] if edge[1] == end_idx else edge[1]
                 other_point = tuple(nodes[other_idx])
 
-                if other_point != start:  # Avoid checking the proposed edge itself
+                if other_point != start:  # 避免检查提议的边本身
                     line1 = (other_point, end)
                     line2 = (end, start)
                     try:
                         angle = angle_between_lines(line1, line2)
                         if angle < max_angle_deg:
-                            return False, f"Angle too sharp ({angle:.1f}°)", 0.0
+                            return False, f"角度过小 ({angle:.1f}°)", 0.0
                     except ValueError:
-                        # Skip if the lines don't share an endpoint
+                        # 如果线没有共享端点则跳过
                         pass
 
     return True, "", 0.0
