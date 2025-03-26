@@ -1,7 +1,7 @@
 """
 Geometry utility functions for airspace network planning.
 """
-
+import warnings
 import numpy as np
 from typing import Tuple, List, Union, Dict, Optional
 
@@ -299,8 +299,8 @@ def is_line_segment_valid(
         adi_zones: List[Dict],
         existing_edges: List[Tuple[int, int]],
         nodes: np.ndarray,
-        node_types: List[int],  # 新增：需要节点类型信息
-        airport_indices: List[int],  # 新增：机场索引列表
+        node_types: List[int] = None,  # 可选参数
+        airport_indices: List[int] = None,  # 可选参数
         max_angle_deg: float = 80.0
 ) -> Tuple[bool, str, float]:
     """
@@ -319,6 +319,14 @@ def is_line_segment_valid(
     Returns:
         Tuple of (is_valid, reason, penalty)
     """
+    # 如果缺少关键参数，发出警告
+    if node_types is None or airport_indices is None:
+        warnings.warn(
+            "node_types 或 airport_indices 未提供，将忽略前沿点/机场连线约束和机场禁飞区约束。"
+            "请提供这些参数以确保所有约束条件都被检查。",
+            UserWarning
+        )
+
     line = (start, end)
 
     # 找到起点和终点的索引
@@ -331,29 +339,28 @@ def is_line_segment_valid(
         if np.allclose(node, end):
             end_idx = i
 
-    if start_idx is None or end_idx is None:
-        return False, "无法找到起点或终点索引", 0.0
+    # 如果提供了节点类型和机场索引，则执行额外约束检查
+    if node_types is not None and airport_indices is not None and start_idx is not None and end_idx is not None:
+        # 约束1和2：禁止前沿点之间或机场之间直接连线
+        if (node_types[start_idx] == 0 and node_types[end_idx] == 0):
+            return False, "前沿点之间禁止直接连线", 0.0
 
-    # 约束1和2：禁止前沿点之间或机场之间直接连线
-    if (node_types[start_idx] == 0 and node_types[end_idx] == 0):
-        return False, "前沿点之间禁止直接连线", 0.0
+        if (node_types[start_idx] == 1 and node_types[end_idx] == 1):
+            return False, "机场之间禁止直接连线", 0.0
 
-    if (node_types[start_idx] == 1 and node_types[end_idx] == 1):
-        return False, "机场之间禁止直接连线", 0.0
+        # 约束3：机场周围20km范围内是禁飞区
+        for airport_idx in airport_indices:
+            airport_point = tuple(nodes[airport_idx])
 
-    # 约束3：机场周围20km范围内是禁飞区
-    for airport_idx in airport_indices:
-        airport_point = tuple(nodes[airport_idx])
+            # 跳过如果起点或终点就是机场本身
+            if start_idx == airport_idx or end_idx == airport_idx:
+                continue
 
-        # 跳过如果起点或终点就是机场本身
-        if start_idx == airport_idx or end_idx == airport_idx:
-            continue
+            # 检查线段是否穿过机场的20km禁飞区
+            airport_no_fly_zone = (airport_point, 20.0)  # 20km半径
 
-        # 检查线段是否穿过机场的20km禁飞区
-        airport_no_fly_zone = (airport_point, 20.0)  # 20km半径
-
-        if does_line_cross_circle(line, airport_no_fly_zone):
-            return False, f"线段穿过机场{airport_idx}的禁飞区", 0.0
+            if does_line_cross_circle(line, airport_no_fly_zone):
+                return False, f"线段穿过机场{airport_idx}的禁飞区", 0.0
 
     # 检查是否穿过任何内部ADI区域（禁止）
     for zone in adi_zones:

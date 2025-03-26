@@ -18,6 +18,7 @@ from utils.geometry import (
     distance_point_to_point,
     is_line_segment_valid,
     does_line_cross_adi_zone,
+    does_line_cross_circle,
     get_danger_zone_penalty
 )
 from environment.utils import (
