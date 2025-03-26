@@ -42,12 +42,13 @@ def evaluate_network_plan(
     frontline_indices = [i for i, t in enumerate(node_types) if t == 0]
     airport_indices = [i for i, t in enumerate(node_types) if t == 1]
 
-    # Get network evaluation
+    # Pass node_types to enforce new connectivity rule
     evaluation = evaluate_network(
         nodes=nodes,
         edges=edges,
         frontline_indices=frontline_indices,
         airport_indices=airport_indices,
+        node_types=node_types,
         adi_zones=cartesian_config['adi_zones'],
         danger_zones=cartesian_config['danger_zones'],
         min_angle_deg=80.0
@@ -75,9 +76,8 @@ def evaluate_network_plan(
     # Visualize all paths
     # Group paths by ADI zone traversal patterns
     path_groups = {}
-
     for i, path in enumerate(evaluation['paths']):
-        if not path:  # Skip empty paths
+        if not path:
             continue
 
         start_idx = frontline_indices[i // len(airport_indices)]
@@ -119,7 +119,7 @@ def evaluate_network_plan(
             end_indices=sample_end_indices,
             adi_zones=cartesian_config['adi_zones'],
             danger_zones=cartesian_config['danger_zones'],
-            node_types=node_types,  # 添加这一行
+            node_types=node_types,
             title=f'Paths for ADI Traversal Pattern {i + 1}'
         )
 
@@ -143,17 +143,17 @@ def evaluate_network_plan(
 
     # Add nodes
     for i, (lat, lon) in enumerate(geo_nodes):
-        node_type = int(node_types[i])  # 转换为标准 Python int
+        node_type = int(node_types[i])
         node_type_str = ['frontline', 'airport', 'common', 'outlier'][node_type]
 
         geojson['features'].append({
             'type': 'Feature',
             'geometry': {
                 'type': 'Point',
-                'coordinates': [float(lon), float(lat)]  # 转换为标准 Python float
+                'coordinates': [float(lon), float(lat)]
             },
             'properties': {
-                'id': int(i),  # 转换为标准 Python int
+                'id': int(i),
                 'type': node_type_str
             }
         })
@@ -165,13 +165,13 @@ def evaluate_network_plan(
             'geometry': {
                 'type': 'LineString',
                 'coordinates': [
-                    [float(geo_nodes[i][1]), float(geo_nodes[i][0])],  # 转换为标准 Python float
-                    [float(geo_nodes[j][1]), float(geo_nodes[j][0])]  # 转换为标准 Python float
+                    [float(geo_nodes[i][1]), float(geo_nodes[i][0])],
+                    [float(geo_nodes[j][1]), float(geo_nodes[j][0])]
                 ]
             },
             'properties': {
-                'from_node': int(i),  # 转换为标准 Python int
-                'to_node': int(j)  # 转换为标准 Python int
+                'from_node': int(i),
+                'to_node': int(j)
             }
         })
 
@@ -181,14 +181,14 @@ def evaluate_network_plan(
             'type': 'Feature',
             'geometry': {
                 'type': 'Point',
-                'coordinates': [float(zone['original_lon']), float(zone['original_lat'])]  # 转换为标准 Python float
+                'coordinates': [float(zone['original_lon']), float(zone['original_lat'])]
             },
             'properties': {
                 'type': 'adi_zone',
-                'id': int(i),  # 转换为标准 Python int
-                'inner_radius': float(zone['radius']),  # 转换为标准 Python float
-                'outer_radius': float(zone['epsilon']),  # 转换为标准 Python float
-                'weapon_type': str(zone['weapon_type'])  # 确保字符串类型
+                'id': int(i),
+                'inner_radius': float(zone['radius']),
+                'outer_radius': float(zone['epsilon']),
+                'weapon_type': str(zone['weapon_type'])
             }
         })
 
@@ -205,8 +205,7 @@ def evaluate_network_plan(
 
     # Save geojson
     with open(os.path.join(output_dir, 'network_plan.geojson'), 'w') as f:
-        json.dump(geojson, f, indent=2, cls=NumpyEncoder)  # 使用自定义编码器
-
+        json.dump(geojson, f, indent=2, cls=NumpyEncoder)
 
 def main():
     """
@@ -235,7 +234,6 @@ def main():
     evaluate_network_plan(nodes, node_types, edges, cartesian_config, args.output_dir)
 
     print(f"Evaluation results saved to {args.output_dir}")
-
 
 if __name__ == '__main__':
     main()
