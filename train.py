@@ -20,6 +20,8 @@ from utils.coordinate_transform import transform_config_to_cartesian
 from environment.node_env import NodePlacementEnv
 from environment.graph_env import GraphConstructionEnv
 from utils.visualization import plot_airspace_network, plot_training_progress, plot_paths_between_points
+from environment.utils import evaluate_network, find_shortest_paths
+
 
 class TrainingProgressCallback(BaseCallback):
     """
@@ -55,10 +57,9 @@ class TrainingProgressCallback(BaseCallback):
 
             # Extract success info if available
             if 'infos' in self.locals and len(self.locals['infos']) > 0:
-                if 'success' in self.locals['infos'][0]:
-                    self.episode_successes.append(self.locals['infos'][0]['success'])
-                elif 'num_connected_pairs' in self.locals['infos'][0] and 'total_pairs' in self.locals['infos'][0]:
-                    success = self.locals['infos'][0]['num_connected_pairs'] == self.locals['infos'][0]['total_pairs']
+                info = self.locals['infos'][0]
+                if 'num_connected_pairs' in info and 'total_pairs' in info:
+                    success = (info['num_connected_pairs'] == info['total_pairs'])
                     self.episode_successes.append(success)
                 else:
                     self.episode_successes.append(False)
@@ -99,6 +100,7 @@ class TrainingProgressCallback(BaseCallback):
             lengths=np.array(self.episode_lengths),
             successes=np.array(self.episode_successes)
         )
+
 
 def train_node_placement(
     cartesian_config: Dict[str, Any],
@@ -161,7 +163,6 @@ def train_node_placement(
         save_path=os.path.join(output_dir, 'node_placement', 'checkpoints'),
         name_prefix='node_placement_model'
     )
-
     progress_callback = TrainingProgressCallback(
         save_path=os.path.join(output_dir, 'node_placement'),
         save_freq=10
@@ -169,7 +170,7 @@ def train_node_placement(
 
     # Create and train model
     model = PPO(
-        'MlpPolicy',  # This is correct for Box observation space
+        'MlpPolicy',
         env,
         learning_rate=learning_rate,
         n_steps=n_steps,
@@ -189,10 +190,7 @@ def train_node_placement(
     # Save final model
     model.save(os.path.join(output_dir, 'node_placement', 'final_model'))
 
-    # ===========================================
-    # Run a modified evaluation process that avoids getting stuck
-    # ===========================================
-
+    # =============== Run a quick evaluation to place nodes ===============
     print("Running evaluation with improved logic to avoid getting stuck...")
 
     # Create evaluation environment
@@ -228,44 +226,32 @@ def train_node_placement(
             # If we've tried the same action too many times, add randomness
             if repeated_action_count >= max_repeat_tries:
                 print(f"Action {action} repeated {repeated_action_count} times, adding randomness...")
-
-                # Generate a random action that's more likely to be valid
-                # First, get bounds from environment
+                import math
+                import random as pyrand
                 x_range = eval_env.x_max - eval_env.x_min
                 y_range = eval_env.y_max - eval_env.y_min
 
                 # Get existing nodes to avoid placing too close
                 fixed_nodes = eval_env.fixed_nodes
-
                 if len(fixed_nodes) > 0:
-                    # Pick a random fixed node as reference
-                    random_node = fixed_nodes[random.randint(0, len(fixed_nodes) - 1)]
-
-                    # Add a random offset (30-100km)
-                    offset_distance = random.uniform(30.0, 100.0)
-                    angle = random.uniform(0, 2 * np.pi)
-
-                    # Calculate new position
-                    x = random_node[0] + offset_distance * np.cos(angle)
-                    y = random_node[1] + offset_distance * np.sin(angle)
-
-                    # Ensure within bounds
+                    base_idx = pyrand.randint(0, len(fixed_nodes)-1)
+                    base_x, base_y = fixed_nodes[base_idx]
+                    offset_dist = pyrand.uniform(30.0, 100.0)
+                    angle = pyrand.uniform(0, 2*math.pi)
+                    x = base_x + offset_dist*math.cos(angle)
+                    y = base_y + offset_dist*math.sin(angle)
                     x = max(eval_env.x_min, min(eval_env.x_max, x))
                     y = max(eval_env.y_min, min(eval_env.y_max, y))
-
-                    # Random node type (0 for common, 1 for outlier)
-                    node_type = random.randint(0, 1)
-
-                    action = np.array([x, y, node_type])
+                    node_type = pyrand.randint(0,1)
+                    action = np.array([x,y,node_type])
                 else:
                     # Fallback to random but more distant
                     action = np.array([
-                        eval_env.x_min + x_range * random.random(),
-                        eval_env.y_min + y_range * random.random(),
-                        random.randint(0, 1)
+                        eval_env.x_min + x_range * pyrand.random(),
+                        eval_env.y_min + y_range * pyrand.random(),
+                        pyrand.randint(0,1)
                     ])
-
-                repeated_action_count = 0  # Reset counter
+                repeated_action_count = 0
         else:
             repeated_action_count = 0
             last_action = action.copy()
@@ -273,7 +259,6 @@ def train_node_placement(
         # Take step in environment
         step_result = eval_env.step(action)
         obs, reward, done, _, info = step_result
-
         step_count += 1
 
         # If this was a valid placement, record it
@@ -310,18 +295,18 @@ def train_node_placement(
         danger_zones=cartesian_config['danger_zones'],
         title='Node Placement Result'
     )
-
     plt.savefig(os.path.join(output_dir, 'node_placement', 'final_nodes.png'))
     plt.close(fig)
 
     return model, (final_nodes, final_node_types)
+
 
 def train_graph_construction(
     cartesian_config: Dict[str, Any],
     nodes: np.ndarray,
     node_types: List[int],
     output_dir: str,
-    n_envs: int = 1,  # Using 1 environment for graph construction is safer
+    n_envs: int = 1,
     n_steps: int = 2048,
     batch_size: int = 64,
     n_epochs: int = 10,
@@ -365,7 +350,7 @@ def train_graph_construction(
     frontline_indices = [i for i, t in enumerate(node_types) if t == 0]
     airport_indices = [i for i, t in enumerate(node_types) if t == 1]
 
-    # For testing, create a basic environment first instead of vectorized one
+    # Test environment
     test_env = GraphConstructionEnv(
         nodes=nodes,
         node_types=node_types,
@@ -405,16 +390,14 @@ def train_graph_construction(
         save_path=os.path.join(output_dir, 'graph_construction', 'checkpoints'),
         name_prefix='graph_construction_model'
     )
-
     progress_callback = TrainingProgressCallback(
         save_path=os.path.join(output_dir, 'graph_construction'),
         save_freq=10
     )
 
-    # Create and train model
-    # Note: We must use MultiInputPolicy instead of MlpPolicy for Dict observation space
+    # Use MultiInputPolicy for dict obs
     model = PPO(
-        'MultiInputPolicy',  # Changed from 'MlpPolicy' to 'MultiInputPolicy'
+        'MultiInputPolicy',
         env,
         learning_rate=learning_rate,
         n_steps=n_steps,
@@ -434,7 +417,7 @@ def train_graph_construction(
     # Save final model
     model.save(os.path.join(output_dir, 'graph_construction', 'final_model'))
 
-    # Run evaluation
+    # ============= 下面是“训练后自动执行评估”阶段  =============
     print("Running graph construction evaluation...")
 
     # Create evaluation environment
@@ -449,34 +432,30 @@ def train_graph_construction(
         max_angle_deg=80.0
     )
 
-    # Get initial observation
-    reset_result = eval_env.reset(seed=seed+100)  # Use a different seed
-    obs = reset_result[0]  # Extract just the observation
+    reset_result = eval_env.reset(seed=seed+100)
+    obs = reset_result[0]
 
-    # Prepare for evaluation
-    max_steps = 100  # Limit to prevent infinite loops
+    max_steps = 100
     step_count = 0
     done = False
     repeated_action_count = 0
     last_action = None
     added_edges = 0
-    max_repeat_tries = 5  # Max number of times to try the same action
+    max_repeat_tries = 5
 
     # Evaluation loop with safety checks
     try:
         while not done and step_count < max_steps:
-            # Get action from model
-            action, _ = model.predict(obs, deterministic=False)  # Use stochastic action to avoid getting stuck
-
-            # Check if we're repeating the same action
+            action, _ = model.predict(obs, deterministic=False)
+            # 处理重复动作
             if last_action is not None and action == last_action:
                 repeated_action_count += 1
 
                 # If we've tried the same action too many times, try random action
                 if repeated_action_count >= max_repeat_tries:
                     print(f"Action {action} repeated {repeated_action_count} times, trying random action...")
-                    # Try a random action from the action space
-                    action = eval_env.action_space.sample()
+                    a = eval_env.action_space.sample()
+                    action = a
                     repeated_action_count = 0
             else:
                 repeated_action_count = 0
@@ -485,13 +464,11 @@ def train_graph_construction(
             # Take step in environment
             step_result = eval_env.step(action)
             obs, reward, done, _, info = step_result
-
             step_count += 1
 
-            # If this added an edge, record it
-            if 'reason' not in info or info['reason'] != 'Invalid action index':
+            if 'reason' not in info or info['reason'] != 'action index out of range':
                 added_edges += 1
-                print(f"Added edge {added_edges}/{max_edges}")
+                #print(f"Added edge {added_edges}/{max_edges}")
 
             # If we've reached connectivity goal, we're done
             if 'num_connected_pairs' in info and 'total_pairs' in info:
@@ -503,15 +480,39 @@ def train_graph_construction(
 
     print(f"Graph evaluation completed after {step_count} steps with {added_edges} edges added")
 
-    # Get the final network
+    # 拿到最终网络
     _, _, final_edges = eval_env.get_network()
 
-    # Save the edges
+    # ------ 新增：打印所有前沿点-机场对的连通统计 ------
+    print("[Auto-Eval] Checking final pairwise connectivity:")
+    all_paths, success_flags = find_shortest_paths(
+        nodes,
+        final_edges,
+        frontline_indices,
+        airport_indices,
+        node_types=node_types
+    )
+    idx_ = 0
+    for f_ in frontline_indices:
+        for a_ in airport_indices:
+            status_ = "CONNECTED" if success_flags[idx_] else "NOT CONNECTED"
+            print(f"  Pair(frontline={f_}, airport={a_}): {status_}")
+            idx_ += 1
+    connected_count = sum(success_flags)
+    total_count = len(success_flags)
+    print(f"[Auto-Eval] connected pairs: {connected_count}/{total_count}")
+    if connected_count == total_count:
+        print("[Auto-Eval] => All pairs are connected! ✅")
+    else:
+        print("[Auto-Eval] => Not all pairs connected. ❌")
+
+    # 保存 edges
     np.savez(
         os.path.join(output_dir, 'graph_construction', 'final_edges.npz'),
         edges=np.array(final_edges)
     )
 
+    # try evaluate network
     try:
         # Get network evaluation
         network_eval = eval_env.get_network_evaluation()
@@ -534,13 +535,13 @@ def train_graph_construction(
             danger_zones=cartesian_config['danger_zones'],
             title='Graph Construction Result'
         )
-
         plt.savefig(os.path.join(output_dir, 'graph_construction', 'final_network.png'))
         plt.close(fig)
     except Exception as e:
         print(f"Warning: Error visualizing network: {e}")
 
     return model, final_edges
+
 
 def main():
     """
@@ -572,7 +573,6 @@ def main():
         total_timesteps=args.node_timesteps,
         n_envs=args.n_envs
     )
-
     print(f"Node placement complete. Generated {len(nodes)} nodes.")
 
     # Train graph construction model
@@ -586,9 +586,8 @@ def main():
         seed=args.seed,
         max_edges=args.max_edges,
         total_timesteps=args.graph_timesteps,
-        n_envs=1  # Using 1 environment for graph construction as it can be complex
+        n_envs=1
     )
-
     print(f"Graph construction complete. Generated {len(edges)} edges.")
 
     # Save final results (both nodes and edges)
@@ -598,8 +597,8 @@ def main():
         node_types=node_types,
         edges=np.array(edges)
     )
-
     print(f"Final results saved to {args.output_dir}/final_network.npz")
+
 
 if __name__ == '__main__':
     main()

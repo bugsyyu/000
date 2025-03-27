@@ -28,12 +28,10 @@ def evaluate_network_plan(
     """
     Evaluate a network plan.
 
-    Args:
-        nodes: Node coordinates
-        node_types: Node types
-        edges: Edges as tuples of node indices
-        cartesian_config: Configuration with Cartesian coordinates
-        output_dir: Directory to save outputs
+    在打印每个前沿点-机场对是否连通后，再汇总统计已连通的数量。
+
+
+    这里新增对每个前沿点-机场对是否连通的打印输出。
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -42,7 +40,7 @@ def evaluate_network_plan(
     frontline_indices = [i for i, t in enumerate(node_types) if t == 0]
     airport_indices = [i for i, t in enumerate(node_types) if t == 1]
 
-    # Pass node_types to enforce new connectivity rule
+    # 综合评估
     evaluation = evaluate_network(
         nodes=nodes,
         edges=edges,
@@ -54,13 +52,37 @@ def evaluate_network_plan(
         min_angle_deg=80.0
     )
 
-    # Save evaluation results
+    # 将评估结果保存到txt
     with open(os.path.join(output_dir, 'network_evaluation.txt'), 'w') as f:
         for key, value in evaluation.items():
             if key not in ['paths', 'adi_traversal_metrics', 'angle_metrics']:
                 f.write(f"{key}: {value}\n")
 
-    # Visualize the network
+    # 打印“起终点对”的连通情况 + 汇总
+    print("[evaluate.py] Checking pairwise connectivity for this network:")
+    all_paths, success_flags = find_shortest_paths(
+        nodes,
+        edges,
+        frontline_indices,
+        airport_indices,
+        node_types=node_types
+    )
+    idx_ = 0
+    for f_ in frontline_indices:
+        for a_ in airport_indices:
+            status_ = "CONNECTED" if success_flags[idx_] else "NOT CONNECTED"
+            print(f"  Pair(frontline={f_}, airport={a_}): {status_}")
+            idx_ += 1
+
+    connected_count = sum(success_flags)
+    total_count = len(success_flags)
+    print(f"connected pairs: {connected_count}/{total_count}")
+    if connected_count == total_count:
+        print("=> All pairs are connected! ✅")
+    else:
+        print("=> Not all pairs connected. ❌")
+
+    # 画网络总体图
     fig, ax = plot_airspace_network(
         nodes=nodes,
         edges=edges,
@@ -69,31 +91,25 @@ def evaluate_network_plan(
         danger_zones=cartesian_config['danger_zones'],
         title='Airspace Network Plan'
     )
-
     plt.savefig(os.path.join(output_dir, 'network_plan.png'))
     plt.close(fig)
 
-    # Visualize all paths
-    # Group paths by ADI zone traversal patterns
+    # 按照 ADI 区外圈模式划分路径并可视化
     path_groups = {}
     for i, path in enumerate(evaluation['paths']):
         if not path:
             continue
-
         start_idx = frontline_indices[i // len(airport_indices)]
         end_idx = airport_indices[i % len(airport_indices)]
 
         # Get ADI traversal pattern as a tuple of booleans
-        adi_pattern = tuple(evaluation['adi_traversal_metrics'][i]) if i < len(
-            evaluation['adi_traversal_metrics']) else tuple([False] * len(cartesian_config['adi_zones']))
-
+        adi_pattern = tuple(evaluation['adi_traversal_metrics'][i]) if i < len(evaluation['adi_traversal_metrics']) else tuple([False]*len(cartesian_config['adi_zones']))
         if adi_pattern not in path_groups:
             path_groups[adi_pattern] = {
                 'paths': [],
                 'start_indices': [],
                 'end_indices': []
             }
-
         path_groups[adi_pattern]['paths'].append(path)
         path_groups[adi_pattern]['start_indices'].append(start_idx)
         path_groups[adi_pattern]['end_indices'].append(end_idx)
@@ -120,17 +136,15 @@ def evaluate_network_plan(
             adi_zones=cartesian_config['adi_zones'],
             danger_zones=cartesian_config['danger_zones'],
             node_types=node_types,
-            title=f'Paths for ADI Traversal Pattern {i + 1}'
+            title=f'Paths for ADI Traversal Pattern {i+1}'
         )
-
-        plt.savefig(os.path.join(output_dir, f'paths_group_{i + 1}.png'))
+        plt.savefig(os.path.join(output_dir, f'paths_group_{i+1}.png'))
         plt.close(fig)
 
-    # Convert to geographic coordinates
+    # 生成并保存 geojson
     geo_nodes = []
     ref_lat = cartesian_config['reference']['lat']
     ref_lon = cartesian_config['reference']['lon']
-
     for node in nodes:
         lat, lon = cartesian_to_lat_lon(node[0], node[1], ref_lat, ref_lon)
         geo_nodes.append((lat, lon))
@@ -141,11 +155,10 @@ def evaluate_network_plan(
         'features': []
     }
 
-    # Add nodes
+    # 添加节点
     for i, (lat, lon) in enumerate(geo_nodes):
         node_type = int(node_types[i])
-        node_type_str = ['frontline', 'airport', 'common', 'outlier'][node_type]
-
+        node_type_str = ['frontline','airport','common','outlier'][node_type]
         geojson['features'].append({
             'type': 'Feature',
             'geometry': {
@@ -158,7 +171,7 @@ def evaluate_network_plan(
             }
         })
 
-    # Add edges
+    # 添加边
     for i, j in edges:
         geojson['features'].append({
             'type': 'Feature',
@@ -175,7 +188,7 @@ def evaluate_network_plan(
             }
         })
 
-    # Add ADI zones
+    # 添加 ADI 区信息
     for i, zone in enumerate(cartesian_config['adi_zones']):
         geojson['features'].append({
             'type': 'Feature',
@@ -207,6 +220,9 @@ def evaluate_network_plan(
     with open(os.path.join(output_dir, 'network_plan.geojson'), 'w') as f:
         json.dump(geojson, f, indent=2, cls=NumpyEncoder)
 
+    print(f"[evaluate.py] Evaluation results saved to {output_dir}")
+
+
 def main():
     """
     Main function to run the evaluation process.
@@ -234,6 +250,7 @@ def main():
     evaluate_network_plan(nodes, node_types, edges, cartesian_config, args.output_dir)
 
     print(f"Evaluation results saved to {args.output_dir}")
+
 
 if __name__ == '__main__':
     main()
