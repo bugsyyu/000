@@ -1,5 +1,13 @@
 """
-Node placement environment for reinforcement learning.
+Node placement environment for reinforcement learning, supporting log_level for debug prints.
+
+Key points:
+  - We introduce log_level to control output verbosity:
+    log_level=1: minimal logs
+    log_level=2: print info each episode (or each invalid action)
+    log_level=3: print step-level debug info
+  - We unify debug_invalid_placement with log_level:
+    Only if debug_invalid_placement=True AND log_level >= 2, we print invalid placement reasons.
 """
 
 import numpy as np
@@ -28,7 +36,11 @@ class NodePlacementEnv(gym.Env):
 
     Action space:
         - Continuous: (x, y, node_type)
-        - node_type: 0 for common node, 1 for outlier node
+          node_type: 0 for common node, 1 for outlier node
+
+    We add log_level and debug_invalid_placement to unify output control:
+      - debug_invalid_placement: master switch to enable/disable printing invalid reasons at all
+      - log_level: if debug_invalid_placement=True, only print reasons if log_level>=2
     """
 
     metadata = {'render.modes': ['human']}
@@ -37,9 +49,11 @@ class NodePlacementEnv(gym.Env):
         self,
         cartesian_config: Dict[str, Any],
         max_nodes: int = 30,
-        min_distance: float = 10.0,  # Minimum distance between nodes in km
+        min_distance: float = 10.0,   # Minimum distance (km) between new node and existing node
         max_distance: float = 150.0,  # Maximum distance for valid node placement
-        render_mode: str = None
+        render_mode: str = None,
+        debug_invalid_placement: bool = True,
+        log_level: int = 1
     ):
         super(NodePlacementEnv, self).__init__()
 
@@ -49,15 +63,17 @@ class NodePlacementEnv(gym.Env):
         self.max_distance = max_distance
         self.render_mode = render_mode
 
-        # Extract relevant data from config
+        # Debug/Logging control
+        self.debug_invalid_placement = debug_invalid_placement
+        self.log_level = log_level
+
+        # Extract data from cartesian_config
         self.frontline_points = np.array([
             [point['x'], point['y']] for point in cartesian_config['frontline']
         ])
-
         self.airport_points = np.array([
             [airport['x'], airport['y']] for airport in cartesian_config['airports']
         ])
-
         self.adi_zones = cartesian_config['adi_zones']
         self.danger_zones = cartesian_config['danger_zones']
 
@@ -68,30 +84,25 @@ class NodePlacementEnv(gym.Env):
         # Compute spatial bounds
         all_x = np.concatenate([self.frontline_points[:, 0], self.airport_points[:, 0]])
         all_y = np.concatenate([self.frontline_points[:, 1], self.airport_points[:, 1]])
-
         x_min, x_max = np.min(all_x), np.max(all_x)
         y_min, y_max = np.min(all_y), np.max(all_y)
-
-        # Add some padding to bounds
-        padding = 50.0  # km
+        padding = 50.0
         self.x_min, self.x_max = x_min - padding, x_max + padding
         self.y_min, self.y_max = y_min - padding, y_max + padding
 
-        # Define action space
-        # (x, y, node_type)
+        # Action space = (x, y, node_type)
+        # node_type is in [0,1], but we keep the box continuous in [0,1]
         self.action_space = spaces.Box(
             low=np.array([self.x_min, self.y_min, 0]),
             high=np.array([self.x_max, self.y_max, 1]),
             dtype=np.float32
         )
 
-        # Define observation space
-        # We include:
-        # - Fixed nodes: [x, y, is_frontline] * num_fixed_nodes
-        # - Current intermediate nodes: [x, y, is_outlier] * max_nodes (padded with zeros)
-        # - ADI zones: [center_x, center_y, inner_radius, outer_radius] * num_adi_zones
-        # - Remaining nodes counter: [count]
-
+        # We'll flatten our observation:
+        # - fixed_nodes (n_fixed * 3): [x, y, is_frontline?]
+        # - intermediate_nodes (max_nodes * 3): [x, y, is_outlier?]
+        # - adi_zones (#adi_zones * 4): [center_x, center_y, inner_radius, outer_radius]
+        # - 1 extra for remaining_nodes
         num_adi_zones = len(self.adi_zones)
 
         # Calculate total observation size
@@ -112,12 +123,12 @@ class NodePlacementEnv(gym.Env):
         # For clustering
         self._suggested_nodes = None
 
-        # Define rewards
+        # Rewards
         self.reward_node_valid = 1.0
         self.reward_node_invalid = -1.0
         self.reward_node_near_adi = 2.0
         self.reward_outlier_valid = 3.0
-        self.reward_efficiency = 0.5  # For placing nodes in efficient locations
+        self.reward_efficiency = 0.5
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None):
         """
@@ -159,7 +170,7 @@ class NodePlacementEnv(gym.Env):
         """
         # Extract action components
         x, y, node_type_float = action
-        node_type = int(round(node_type_float))  # Convert to binary 0 or 1
+        node_type = int(round(node_type_float))
 
         # Check if we've placed all available nodes
         if self.remaining_nodes <= 0:
@@ -171,37 +182,36 @@ class NodePlacementEnv(gym.Env):
 
         # If valid, add the node
         if is_valid:
+            # Place the node
             self.intermediate_nodes.append([x, y])
             self.intermediate_node_types.append(node_type)
             self.remaining_nodes -= 1
 
-            # Extra reward logic
+            # Additional logic
             reward = validity_reward
 
             # Reward for placing nodes near suggested positions
             if self._suggested_nodes is not None and len(self._suggested_nodes) > 0:
                 for suggested_node in self._suggested_nodes:
                     dist = np.sqrt((x - suggested_node[0])**2 + (y - suggested_node[1])**2)
-                    if dist < 20.0:  # km
+                    if dist < 20.0:
                         reward += self.reward_efficiency
                         break
 
             # Additional reward for valid outlier node placement
             if node_type == 1:
-                # Check if it's really an outlier region
-                is_outlier_region = self._is_outlier_region(x, y)
-                if is_outlier_region:
+                if self._is_outlier_region(x, y):
                     reward += self.reward_outlier_valid
 
-            # Check if we're done
-            done = self.remaining_nodes <= 0
-
-            # Get new observation
+            done = (self.remaining_nodes <= 0)
             obs = self._get_observation()
+            return obs, reward, done, False, {'reason': 'Valid placement', 'is_outlier': (node_type == 1)}
 
-            return obs, reward, done, False, {'reason': 'Valid placement', 'is_outlier': node_type == 1}
         else:
-            # Invalid placement, return negative reward and same state
+            # Invalid
+            # Only print reason if debug_invalid_placement=True and log_level > 2
+            if self.debug_invalid_placement and self.log_level > 2:
+                print(f"[NodePlacementEnv] Invalid node (x={x:.2f}, y={y:.2f}, type={node_type}): {reason}")
             obs = self._get_observation()
             return obs, validity_reward, False, False, {'reason': reason}
 
@@ -228,7 +238,7 @@ class NodePlacementEnv(gym.Env):
         # Combine fixed and intermediate nodes
         all_nodes = np.vstack([
             self.fixed_nodes,
-            np.array(self.intermediate_nodes) if self.intermediate_nodes else np.zeros((0, 2))
+            np.array(self.intermediate_nodes) if self.intermediate_nodes else np.zeros((0,2))
         ])
 
         # Create node types list
@@ -238,13 +248,12 @@ class NodePlacementEnv(gym.Env):
         # Add fixed node types
         num_frontline = len(self.frontline_points)
         num_airports = len(self.airport_points)
-
-        node_types.extend([0] * num_frontline)  # Frontline points
-        node_types.extend([1] * num_airports)  # Airport points
+        node_types.extend([0]*num_frontline)  # 0=frontline
+        node_types.extend([1]*num_airports)   # 1=airport
 
         # Add intermediate node types
-        for node_type in self.intermediate_node_types:
-            node_types.append(2 + node_type)  # 2 for common, 3 for outlier
+        for nt in self.intermediate_node_types:
+            node_types.append(2+nt)  # 2=common,3=outlier
 
         return all_nodes, node_types
 
@@ -269,7 +278,6 @@ class NodePlacementEnv(gym.Env):
 
         # Prepare intermediate nodes section (padded with zeros)
         intermediate_obs = np.zeros((self.max_nodes, 3))
-
         num_intermediate = len(self.intermediate_nodes)
         if num_intermediate > 0:
             intermediate_obs[:num_intermediate, :2] = np.array(self.intermediate_nodes)
@@ -277,7 +285,6 @@ class NodePlacementEnv(gym.Env):
 
         # Prepare ADI zones section
         adi_obs = np.zeros((len(self.adi_zones), 4))
-
         for i, zone in enumerate(self.adi_zones):
             adi_obs[i, 0] = zone['center_x']
             adi_obs[i, 1] = zone['center_y']
@@ -294,7 +301,6 @@ class NodePlacementEnv(gym.Env):
             adi_obs.flatten(),
             counter_obs
         ])
-
         return obs
 
     def _check_node_validity(self, x: float, y: float) -> Tuple[bool, float, str]:
@@ -308,45 +314,43 @@ class NodePlacementEnv(gym.Env):
         Returns:
             Tuple of (is_valid, reward, reason)
         """
-        # Check if node is within bounds
+        # 1) Bounds
         if x < self.x_min or x > self.x_max or y < self.y_min or y > self.y_max:
             return False, self.reward_node_invalid, "Out of bounds"
 
-        # Check if node is inside any ADI inner zone (not allowed)
+        # 2) Inside ADI inner zone?
         for zone in self.adi_zones:
             center = (zone['center_x'], zone['center_y'])
             inner_radius = zone['radius']
-
-            if is_point_in_circle((x, y), (center, inner_radius)):
+            if is_point_in_circle((x,y), (center, inner_radius)):
                 return False, self.reward_node_invalid, "Inside ADI inner zone"
 
-        # Check if node is too close to existing nodes
+        # 3) Too close to existing nodes
         for node in self.fixed_nodes:
             dist = np.sqrt((x - node[0])**2 + (y - node[1])**2)
             if dist < self.min_distance:
                 return False, self.reward_node_invalid, "Too close to fixed node"
-
         for node in self.intermediate_nodes:
             dist = np.sqrt((x - node[0])**2 + (y - node[1])**2)
             if dist < self.min_distance:
                 return False, self.reward_node_invalid, "Too close to intermediate node"
 
-        # Check if node is too far from any existing node
+        # 4) Too far from any node
+        all_current_nodes = np.vstack([self.fixed_nodes, np.array(self.intermediate_nodes) if self.intermediate_nodes else np.zeros((0,2))])
         min_dist_to_any = float('inf')
-        for node in np.vstack([self.fixed_nodes, np.array(self.intermediate_nodes) if self.intermediate_nodes else np.zeros((0, 2))]):
+        for node in all_current_nodes:
             dist = np.sqrt((x - node[0])**2 + (y - node[1])**2)
-            min_dist_to_any = min(min_dist_to_any, dist)
-
+            if dist < min_dist_to_any:
+                min_dist_to_any = dist
         if min_dist_to_any > self.max_distance:
             return False, self.reward_node_invalid, "Too far from any node"
 
-        # Check if node is near ADI outer zone (preferred)
+        # 5) near ADI outer => extra reward
         near_adi_outer = False
         for zone in self.adi_zones:
             center = (zone['center_x'], zone['center_y'])
             outer_radius = zone['epsilon']
             inner_radius = zone['radius']
-
             dist_to_center = np.sqrt((x - center[0])**2 + (y - center[1])**2)
 
             # Check if the node is near the outer edge
@@ -377,23 +381,13 @@ class NodePlacementEnv(gym.Env):
         # Get all nodes
         all_nodes = np.vstack([
             self.fixed_nodes,
-            np.array(self.intermediate_nodes) if self.intermediate_nodes else np.zeros((0, 2))
+            np.array(self.intermediate_nodes) if self.intermediate_nodes else np.zeros((0,2))
         ])
-
-        # Calculate distances to all nodes
-        distances = []
-        for node in all_nodes:
-            dist = np.sqrt((x - node[0])**2 + (y - node[1])**2)
-            distances.append(dist)
-
-        # If the closest node is far away, it's an outlier region
-        if min(distances) > 50.0:  # km
+        dists = [np.sqrt((x - n[0])**2 + (y - n[1])**2) for n in all_nodes]
+        if min(dists) > 50.0:
             return True
-
-        # If the average distance is high, it's an outlier region
-        if np.mean(distances) > 100.0:  # km
+        if np.mean(dists) > 100.0:
             return True
-
         return False
 
     def _suggest_initial_nodes(self) -> np.ndarray:
@@ -413,5 +407,4 @@ class NodePlacementEnv(gym.Env):
             max_intermediate_nodes=self.max_nodes,
             isolation_threshold=100.0
         )
-
         return suggested_nodes

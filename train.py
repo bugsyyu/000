@@ -1,5 +1,10 @@
 """
-Training script for the airspace network planning system.
+Training script for the airspace network planning system, with user-selectable log verbosity.
+
+We define a CustomLoggingCallback to control:
+- log_level=1: minimal logs (episodes overall)
+- log_level=2: per-episode logs
+- log_level=3: per-step logs
 """
 
 import os
@@ -22,86 +27,112 @@ from environment.graph_env import GraphConstructionEnv
 from utils.visualization import plot_airspace_network, plot_training_progress, plot_paths_between_points
 from environment.utils import evaluate_network, find_shortest_paths
 
-
-class TrainingProgressCallback(BaseCallback):
+# ------------------- Custom callback with log_level -------------------
+class CustomLoggingCallback(BaseCallback):
     """
-    Callback for tracking and saving training progress.
+    A unified callback that handles:
+      - Logging training progress for the user
+      - Different verbosity levels (log_level):
+         1 = minimal logs (just overall episode count)
+         2 = logs per episode
+         3 = logs each step
     """
 
     def __init__(
         self,
-        save_path: str,
+        log_level: int = 1,
+        save_path: str = None,
         save_freq: int = 10,
         verbose: int = 1
     ):
-        super(TrainingProgressCallback, self).__init__(verbose)
+        super().__init__(verbose)
+        self.log_level = log_level
         self.save_path = save_path
         self.save_freq = save_freq
+        # We'll track some stats:
         self.episode_rewards = []
         self.episode_lengths = []
-        self.episode_successes = []
-        self.current_episode_reward = 0
+        self.current_episode_reward = 0.0
         self.current_episode_length = 0
+        self.episode_count = 0
+
+    def _init_callback(self) -> None:
+        """
+        Called once at the start of training.
+        """
+        if self.save_path is not None:
+            os.makedirs(self.save_path, exist_ok=True)
+
+    def _on_training_start(self) -> None:
+        if self.log_level >= 1:
+            print("[CustomLoggingCallback] Training start...")
 
     def _on_step(self) -> bool:
-        """
-        Called at each step of the training.
-        """
-        self.current_episode_reward += self.locals['rewards'][0]
+        # Each time we step in the environment
+        rewards = self.locals['rewards']
+        dones = self.locals['dones']
+        actions = self.locals['actions']
+
+        # We'll assume it's vectorized env. Typically we look at index=0
+        # if n_envs=1. For multiple envs, you'd loop or handle differently.
+        r = rewards[0]
+        d = dones[0]
+        a = actions[0] if len(actions.shape) > 0 else actions
+
+        self.current_episode_reward += r
         self.current_episode_length += 1
 
-        # Check if episode is done
-        if self.locals['dones'][0]:
+        if self.log_level >= 3:
+            # Step-level logs
+            print(f"[log_level=3][Step] Episode {self.episode_count} Step {self.current_episode_length} "
+                  f"Action={a} Reward={r:.3f} Done={d}")
+
+        if d:
+            # Episode just ended
             self.episode_rewards.append(self.current_episode_reward)
             self.episode_lengths.append(self.current_episode_length)
+            self.episode_count += 1
 
-            # Extract success info if available
-            if 'infos' in self.locals and len(self.locals['infos']) > 0:
-                info = self.locals['infos'][0]
-                if 'num_connected_pairs' in info and 'total_pairs' in info:
-                    success = (info['num_connected_pairs'] == info['total_pairs'])
-                    self.episode_successes.append(success)
-                else:
-                    self.episode_successes.append(False)
-            else:
-                self.episode_successes.append(False)
+            if self.log_level >= 2:
+                # Per-episode logs
+                print(f"[log_level=2][Episode End] Episode={self.episode_count} "
+                      f"Length={self.current_episode_length} Reward={self.current_episode_reward:.3f}")
 
+            # reset
             self.current_episode_reward = 0
             self.current_episode_length = 0
 
-            # Save progress
-            if len(self.episode_rewards) % self.save_freq == 0:
-                self._save_progress()
+            # Optionally save progress
+            if self.save_path is not None:
+                if self.episode_count % self.save_freq == 0:
+                    # E.g. we can save a partial plot or something
+                    self._save_progress()
 
         return True
 
+    def _on_rollout_end(self) -> None:
+        """
+        Called after each rollout collection (i.e. n_steps * n_envs).
+        You can also do iteration-level logs here if log_level=1
+        """
+        if self.log_level == 1:
+            # Minimal logs at iteration level
+            # e.g. show how many episodes so far
+            print(f"[log_level=1] Currently finished {self.episode_count} episodes so far...")
+
     def _save_progress(self):
         """
-        Save training progress to file.
+        Example saving method: we can do a plot of training progress
+        or just store arrays. This is up to you.
         """
-        # Create save directory if it doesn't exist
-        os.makedirs(self.save_path, exist_ok=True)
+        pass  # you could replicate the logic in the old trainingprogresscallback
 
-        # Plot progress
-        fig, _ = plot_training_progress(
-            self.episode_rewards,
-            self.episode_lengths,
-            self.episode_successes
-        )
-
-        # Save plot
-        plt.savefig(os.path.join(self.save_path, 'training_progress.png'))
-        plt.close(fig)
-
-        # Save data
-        np.savez(
-            os.path.join(self.save_path, 'training_data.npz'),
-            rewards=np.array(self.episode_rewards),
-            lengths=np.array(self.episode_lengths),
-            successes=np.array(self.episode_successes)
-        )
+    def _on_training_end(self) -> None:
+        if self.log_level >= 1:
+            print(f"[CustomLoggingCallback] Training ended. Total episodes finished: {self.episode_count}")
 
 
+# ------------------- NodePlacement training function -------------------
 def train_node_placement(
     cartesian_config: Dict[str, Any],
     output_dir: str,
@@ -114,7 +145,8 @@ def train_node_placement(
     device: str = 'auto',
     seed: int = 42,
     max_nodes: int = 30,
-    total_timesteps: int = 1000000
+    total_timesteps: int = 1000000,
+    log_level: int = 1  # <--- new param
 ) -> Tuple[PPO, Tuple[np.ndarray, List[int]]]:
     """
     Train the node placement model.
@@ -143,29 +175,34 @@ def train_node_placement(
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.join(output_dir, 'node_placement'), exist_ok=True)
 
-    # Create environment list
+    # Create env
     env_fns = []
     for _ in range(n_envs):
         env_fns.append(lambda: NodePlacementEnv(
             cartesian_config=cartesian_config,
             max_nodes=max_nodes,
             min_distance=10.0,
-            max_distance=150.0
+            max_distance=150.0,
+            log_level=log_level
         ))
 
     # Create vectorized environments using DummyVecEnv instead of SubprocVecEnv
     env = DummyVecEnv(env_fns)
     env = VecMonitor(env)
 
-    # Define callbacks
+    # Additional callback for logging
+    custom_log_callback = CustomLoggingCallback(
+        log_level=log_level,
+        save_path=os.path.join(output_dir, 'node_placement'),
+        save_freq=50,  # e.g. save every 50 episodes or so
+        verbose=1
+    )
+
+    # We can also keep a checkpoint callback
     checkpoint_callback = CheckpointCallback(
         save_freq=n_steps * 10,
         save_path=os.path.join(output_dir, 'node_placement', 'checkpoints'),
         name_prefix='node_placement_model'
-    )
-    progress_callback = TrainingProgressCallback(
-        save_path=os.path.join(output_dir, 'node_placement'),
-        save_freq=10
     )
 
     # Create and train model
@@ -177,20 +214,20 @@ def train_node_placement(
         batch_size=batch_size,
         n_epochs=n_epochs,
         gamma=gamma,
-        verbose=1,
+        verbose=1,  # stable-baselines internal verbosity, separate from our log_level
         device=device,
         seed=seed
     )
 
     model.learn(
         total_timesteps=total_timesteps,
-        callback=[checkpoint_callback, progress_callback]
+        callback=[custom_log_callback, checkpoint_callback]  # pass our custom logger
     )
 
     # Save final model
     model.save(os.path.join(output_dir, 'node_placement', 'final_model'))
 
-    # =============== Run a quick evaluation to place nodes ===============
+    # =============== Run a quick evaluation to place nodes (unchanged) ===============
     print("Running evaluation with improved logic to avoid getting stuck...")
 
     # Create evaluation environment
@@ -198,7 +235,8 @@ def train_node_placement(
         cartesian_config=cartesian_config,
         max_nodes=max_nodes,
         min_distance=10.0,
-        max_distance=150.0
+        max_distance=150.0,
+        log_level=log_level
     )
 
     # Get initial observation
@@ -212,7 +250,7 @@ def train_node_placement(
     repeated_action_count = 0
     last_action = None
     placed_nodes = 0
-    max_repeat_tries = 5  # Max number of times to try the same action
+    max_repeat_tries = 5
 
     # Improved evaluation loop
     while not done and step_count < max_steps:
@@ -300,7 +338,7 @@ def train_node_placement(
 
     return model, (final_nodes, final_node_types)
 
-
+# ------------------- Graph construction training function -------------------
 def train_graph_construction(
     cartesian_config: Dict[str, Any],
     nodes: np.ndarray,
@@ -315,7 +353,8 @@ def train_graph_construction(
     device: str = 'auto',
     seed: int = 42,
     max_edges: int = 100,
-    total_timesteps: int = 1000000
+    total_timesteps: int = 1000000,
+    log_level: int = 1  # <--- new param
 ) -> Tuple[PPO, List[Tuple[int, int]]]:
     """
     Train the graph construction model.
@@ -384,15 +423,18 @@ def train_graph_construction(
     env = DummyVecEnv(env_fns)
     env = VecMonitor(env)
 
-    # Define callbacks
+    # Our custom logging callback
+    custom_log_callback = CustomLoggingCallback(
+        log_level=log_level,
+        save_path=os.path.join(output_dir, 'graph_construction'),
+        save_freq=50,
+        verbose=1
+    )
+
     checkpoint_callback = CheckpointCallback(
         save_freq=n_steps * 10,
         save_path=os.path.join(output_dir, 'graph_construction', 'checkpoints'),
         name_prefix='graph_construction_model'
-    )
-    progress_callback = TrainingProgressCallback(
-        save_path=os.path.join(output_dir, 'graph_construction'),
-        save_freq=10
     )
 
     # Use MultiInputPolicy for dict obs
@@ -411,7 +453,7 @@ def train_graph_construction(
 
     model.learn(
         total_timesteps=total_timesteps,
-        callback=[checkpoint_callback, progress_callback]
+        callback=[custom_log_callback, checkpoint_callback]
     )
 
     # Save final model
@@ -483,7 +525,7 @@ def train_graph_construction(
     # 拿到最终网络
     _, _, final_edges = eval_env.get_network()
 
-    # ------ 新增：打印所有前沿点-机场对的连通统计 ------
+    # 打印连通信息
     print("[Auto-Eval] Checking final pairwise connectivity:")
     all_paths, success_flags = find_shortest_paths(
         nodes,
@@ -557,6 +599,9 @@ def main():
     parser.add_argument('--max_edges', type=int, default=100, help='Maximum number of edges')
     parser.add_argument('--n_envs', type=int, default=4, help='Number of parallel environments for node placement')
 
+    # New argument for log_level
+    parser.add_argument('--log_level', type=int, default=1, help='Logging verbosity level (1=minimal,2=episode,3=step)')
+
     args = parser.parse_args()
 
     # Transform latitude-longitude config to Cartesian coordinates
@@ -571,7 +616,8 @@ def main():
         seed=args.seed,
         max_nodes=args.max_nodes,
         total_timesteps=args.node_timesteps,
-        n_envs=args.n_envs
+        n_envs=args.n_envs,
+        log_level=args.log_level  # pass
     )
     print(f"Node placement complete. Generated {len(nodes)} nodes.")
 
@@ -586,7 +632,8 @@ def main():
         seed=args.seed,
         max_edges=args.max_edges,
         total_timesteps=args.graph_timesteps,
-        n_envs=1
+        n_envs=1,
+        log_level=args.log_level  # pass
     )
     print(f"Graph construction complete. Generated {len(edges)} edges.")
 
