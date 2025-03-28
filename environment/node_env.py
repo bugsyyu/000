@@ -8,6 +8,10 @@ Key points:
     log_level=3: print step-level debug info
   - We unify debug_invalid_placement with log_level:
     Only if debug_invalid_placement=True AND log_level >= 2, we print invalid placement reasons.
+
+修复要点：
+  - 增加对连续非法放置次数的计数，一旦过多，就提前 done=True，避免陷入无限非法动作循环。
+  - 使环境不会在大量回合内都只得到 "Too close to intermediate node" 而无从收敛。
 """
 
 import numpy as np
@@ -53,7 +57,9 @@ class NodePlacementEnv(gym.Env):
         max_distance: float = 150.0,  # Maximum distance for valid node placement
         render_mode: str = None,
         debug_invalid_placement: bool = True,
-        log_level: int = 1
+        log_level: int = 1,
+        # ---------------- 新增可配置参数 ----------------
+        max_invalid_placements_per_episode: int = 50
     ):
         super(NodePlacementEnv, self).__init__()
 
@@ -66,6 +72,10 @@ class NodePlacementEnv(gym.Env):
         # Debug/Logging control
         self.debug_invalid_placement = debug_invalid_placement
         self.log_level = log_level
+
+        # 新增：当单回合非法放置次数超过此阈值，则提前结束
+        self.max_invalid_placements_per_episode = max_invalid_placements_per_episode
+        self.invalid_placement_count = 0  # 计数器
 
         # Extract data from cartesian_config
         self.frontline_points = np.array([
@@ -149,6 +159,9 @@ class NodePlacementEnv(gym.Env):
         self.intermediate_node_types = []
         self.remaining_nodes = self.max_nodes
 
+        # Reset非法动作计数器
+        self.invalid_placement_count = 0
+
         # Detect outliers and suggest initial nodes
         self._suggested_nodes = self._suggest_initial_nodes()
 
@@ -180,9 +193,12 @@ class NodePlacementEnv(gym.Env):
         # Check if node placement is valid
         is_valid, validity_reward, reason = self._check_node_validity(x, y)
 
-        # If valid, add the node
+        done = False
+        truncated = False
+        info_extra = {}
+
         if is_valid:
-            # Place the node
+            # Valid placement
             self.intermediate_nodes.append([x, y])
             self.intermediate_node_types.append(node_type)
             self.remaining_nodes -= 1
@@ -203,17 +219,32 @@ class NodePlacementEnv(gym.Env):
                 if self._is_outlier_region(x, y):
                     reward += self.reward_outlier_valid
 
-            done = (self.remaining_nodes <= 0)
+            # If we've used up all placements, we are done
+            if self.remaining_nodes <= 0:
+                done = True
+
             obs = self._get_observation()
-            return obs, reward, done, False, {'reason': 'Valid placement', 'is_outlier': (node_type == 1)}
+            info_extra = {'reason': 'Valid placement', 'is_outlier': (node_type == 1)}
 
         else:
             # Invalid
             # Only print reason if debug_invalid_placement=True and log_level > 2
             if self.debug_invalid_placement and self.log_level > 2:
                 print(f"[NodePlacementEnv] Invalid node (x={x:.2f}, y={y:.2f}, type={node_type}): {reason}")
+
+            self.invalid_placement_count += 1  # 累计非法动作
+            reward = validity_reward  # 通常为负值
+
+            # 如果超过阈值，则结束本回合
+            if self.invalid_placement_count >= self.max_invalid_placements_per_episode:
+                done = True
+                info_extra = {
+                    'reason': f'Max invalid placements reached: {self.invalid_placement_count}'
+                }
+
             obs = self._get_observation()
-            return obs, validity_reward, False, False, {'reason': reason}
+
+        return obs, reward, done, truncated, info_extra
 
     def render(self, mode='human'):
         """
