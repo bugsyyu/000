@@ -6,12 +6,12 @@ Key points:
     log_level=1: minimal logs
     log_level=2: print info each episode (or each invalid action)
     log_level=3: print step-level debug info
-  - We unify debug_invalid_placement with log_level:
-    Only if debug_invalid_placement=True AND log_level >= 2, we print invalid placement reasons.
+  - We unify debug_invalid_placement with log_level.
+  - We added a mechanism to end the episode if too many invalid placements occur.
 
-修复要点：
-  - 增加对连续非法放置次数的计数，一旦过多，就提前 done=True，避免陷入无限非法动作循环。
-  - 使环境不会在大量回合内都只得到 "Too close to intermediate node" 而无从收敛。
+Performance fix:
+  - Only call _suggest_initial_nodes() once in the constructor, not in reset().
+  - Avoid repeated clustering calls that slow down training when episodes end quickly.
 """
 
 import numpy as np
@@ -45,6 +45,11 @@ class NodePlacementEnv(gym.Env):
     We add log_level and debug_invalid_placement to unify output control:
       - debug_invalid_placement: master switch to enable/disable printing invalid reasons at all
       - log_level: if debug_invalid_placement=True, only print reasons if log_level>=2
+
+    Performance improvement:
+      - _suggest_initial_nodes() is now called once in the constructor.
+        This prevents re-doing clustering on every reset() call, which
+        was extremely costly if episodes ended quickly.
     """
 
     metadata = {'render.modes': ['human']}
@@ -58,7 +63,6 @@ class NodePlacementEnv(gym.Env):
         render_mode: str = None,
         debug_invalid_placement: bool = True,
         log_level: int = 1,
-        # ---------------- 新增可配置参数 ----------------
         max_invalid_placements_per_episode: int = 50
     ):
         super(NodePlacementEnv, self).__init__()
@@ -75,7 +79,7 @@ class NodePlacementEnv(gym.Env):
 
         # 新增：当单回合非法放置次数超过此阈值，则提前结束
         self.max_invalid_placements_per_episode = max_invalid_placements_per_episode
-        self.invalid_placement_count = 0  # 计数器
+        self.invalid_placement_count = 0  # 计数器；will reset each episode
 
         # Extract data from cartesian_config
         self.frontline_points = np.array([
@@ -114,8 +118,6 @@ class NodePlacementEnv(gym.Env):
         # - adi_zones (#adi_zones * 4): [center_x, center_y, inner_radius, outer_radius]
         # - 1 extra for remaining_nodes
         num_adi_zones = len(self.adi_zones)
-
-        # Calculate total observation size
         obs_size = (self.num_fixed_nodes * 3) + (self.max_nodes * 3) + (num_adi_zones * 4) + 1
 
         self.observation_space = spaces.Box(
@@ -131,7 +133,9 @@ class NodePlacementEnv(gym.Env):
         self.remaining_nodes = self.max_nodes
 
         # For clustering
-        self._suggested_nodes = None
+        # IMPORTANT: We do it once here, not in reset(). That was the performance issue previously.
+        # self._suggested_nodes = None
+        self._suggested_nodes = self._suggest_initial_nodes()
 
         # Rewards
         self.reward_node_valid = 1.0
@@ -162,10 +166,8 @@ class NodePlacementEnv(gym.Env):
         # Reset非法动作计数器
         self.invalid_placement_count = 0
 
-        # Detect outliers and suggest initial nodes
-        self._suggested_nodes = self._suggest_initial_nodes()
-
-        # Get current observation
+        # We do NOT re-run _suggest_initial_nodes() here, to avoid heavy clustering each episode
+        # self._suggested_nodes = self._suggest_initial_nodes()
         obs = self._get_observation()
 
         # Return obs and empty info dict to comply with gymnasium/sb3 interface
@@ -206,7 +208,7 @@ class NodePlacementEnv(gym.Env):
             # Additional logic
             reward = validity_reward
 
-            # Reward for placing nodes near suggested positions
+            # Efficiency reward if near suggested node
             if self._suggested_nodes is not None and len(self._suggested_nodes) > 0:
                 for suggested_node in self._suggested_nodes:
                     dist = np.sqrt((x - suggested_node[0])**2 + (y - suggested_node[1])**2)
@@ -214,7 +216,7 @@ class NodePlacementEnv(gym.Env):
                         reward += self.reward_efficiency
                         break
 
-            # Additional reward for valid outlier node placement
+            # Extra reward for outlier node if truly outlier region
             if node_type == 1:
                 if self._is_outlier_region(x, y):
                     reward += self.reward_outlier_valid
@@ -222,9 +224,10 @@ class NodePlacementEnv(gym.Env):
             # If we've used up all placements, we are done
             if self.remaining_nodes <= 0:
                 done = True
+                info_extra['reason'] = 'All nodes placed'
 
             obs = self._get_observation()
-            info_extra = {'reason': 'Valid placement', 'is_outlier': (node_type == 1)}
+            info_extra['is_outlier'] = (node_type == 1)
 
         else:
             # Invalid
@@ -238,9 +241,7 @@ class NodePlacementEnv(gym.Env):
             # 如果超过阈值，则结束本回合
             if self.invalid_placement_count >= self.max_invalid_placements_per_episode:
                 done = True
-                info_extra = {
-                    'reason': f'Max invalid placements reached: {self.invalid_placement_count}'
-                }
+                info_extra['reason'] = f"Max invalid placements reached: {self.invalid_placement_count}"
 
             obs = self._get_observation()
 
@@ -305,7 +306,7 @@ class NodePlacementEnv(gym.Env):
 
         # Add airport points
         fixed_nodes_obs[num_frontline:, :2] = self.airport_points
-        fixed_nodes_obs[num_frontline:, 2] = 0.0  # not frontline
+        fixed_nodes_obs[num_frontline:, 2] = 0.0  # airport
 
         # Prepare intermediate nodes section (padded with zeros)
         intermediate_obs = np.zeros((self.max_nodes, 3))
