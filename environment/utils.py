@@ -297,6 +297,7 @@ def evaluate_network(
 
     for path in paths:
         if not path:
+            adi_traversal_metrics.append([False]*len(adi_zones))
             continue
 
         zone_traversals = check_adi_zone_traversal(path, nodes, adi_zones)
@@ -311,6 +312,7 @@ def evaluate_network(
 
     for path in paths:
         if not path or len(path) < 3:
+            angle_metrics.append([])
             continue
 
         angles = check_path_angles(path, nodes, min_angle_deg)
@@ -392,7 +394,7 @@ def extract_features_for_gnn(
     num_nodes = len(nodes)
 
     # 确定节点类型的最大值，用于one-hot编码
-    max_node_type = max(node_types)
+    max_node_type = max(node_types) if node_types else 0
     unique_node_types = max_node_type + 1  # 0到max_node_type的数量
 
     # 修复: 调整节点特征维度，确保one-hot编码与节点类型匹配

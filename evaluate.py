@@ -7,8 +7,9 @@ import argparse
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from typing import Dict, Any, List, Tuple
 import json
+import logging
+from typing import Dict, Any, List, Tuple
 
 from config.latlon_config import latlon_config
 from utils.coordinate_transform import transform_config_to_cartesian, cartesian_to_lat_lon
@@ -17,6 +18,7 @@ from environment.graph_env import GraphConstructionEnv
 from utils.visualization import plot_airspace_network, plot_paths_between_points
 from environment.utils import evaluate_network, find_shortest_paths
 
+logger = logging.getLogger(__name__)
 
 def evaluate_network_plan(
         nodes: np.ndarray,
@@ -59,7 +61,7 @@ def evaluate_network_plan(
                 f.write(f"{key}: {value}\n")
 
     # 打印“起终点对”的连通情况 + 汇总
-    print("[evaluate.py] Checking pairwise connectivity for this network:")
+    logger.info("[evaluate.py] Checking pairwise connectivity for this network:")
     all_paths, success_flags = find_shortest_paths(
         nodes,
         edges,
@@ -71,18 +73,17 @@ def evaluate_network_plan(
     for f_ in frontline_indices:
         for a_ in airport_indices:
             status_ = "CONNECTED" if success_flags[idx_] else "NOT CONNECTED"
-            print(f"  Pair(frontline={f_}, airport={a_}): {status_}")
+            logger.info("  Pair(frontline=%d, airport=%d): %s", f_, a_, status_)
             idx_ += 1
 
     connected_count = sum(success_flags)
     total_count = len(success_flags)
-    print(f"connected pairs: {connected_count}/{total_count}")
+    logger.info("connected pairs: %d/%d", connected_count, total_count)
     if connected_count == total_count:
-        print("=> All pairs are connected! ✅")
+        logger.info("=> All pairs are connected! ✅")
     else:
-        print("=> Not all pairs connected. ❌")
+        logger.info("=> Not all pairs connected. ❌")
 
-    # 画网络总体图
     fig, ax = plot_airspace_network(
         nodes=nodes,
         edges=edges,
@@ -117,6 +118,7 @@ def evaluate_network_plan(
     # Visualize each group
     for i, (adi_pattern, group) in enumerate(path_groups.items()):
         if len(group['paths']) > 10:
+            import random
             # If too many paths in a group, sample 10
             indices = np.random.choice(len(group['paths']), 10, replace=False)
             sample_paths = [group['paths'][j] for j in indices]
@@ -126,7 +128,6 @@ def evaluate_network_plan(
             sample_paths = group['paths']
             sample_start_indices = group['start_indices']
             sample_end_indices = group['end_indices']
-
         fig, ax = plot_paths_between_points(
             nodes=nodes,
             edges=edges,
@@ -220,8 +221,7 @@ def evaluate_network_plan(
     with open(os.path.join(output_dir, 'network_plan.geojson'), 'w') as f:
         json.dump(geojson, f, indent=2, cls=NumpyEncoder)
 
-    print(f"[evaluate.py] Evaluation results saved to {output_dir}")
-
+    logger.info("[evaluate.py] Evaluation results saved to %s", output_dir)
 
 def main():
     """
@@ -230,15 +230,19 @@ def main():
     parser = argparse.ArgumentParser(description='Evaluate the airspace network planning system.')
     parser.add_argument('--input_file', type=str, required=True, help='Input file with network data')
     parser.add_argument('--output_dir', type=str, default='./evaluation', help='Output directory')
+    parser.add_argument('--log_level', type=int, default=2, help='Logging verbosity (1=minimal,2=info,3=debug)')
 
     args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.log_level >= 3 else (logging.INFO if args.log_level == 2 else logging.WARNING),
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+    )
 
     # Load network data
     data = np.load(args.input_file)
     nodes = data['nodes']
     node_types = data['node_types']
     edges = data['edges']
-
     if edges.ndim == 2 and edges.shape[1] == 2:
         # Convert to list of tuples
         edges = [tuple(edge) for edge in edges]
@@ -249,8 +253,7 @@ def main():
     # Evaluate the network
     evaluate_network_plan(nodes, node_types, edges, cartesian_config, args.output_dir)
 
-    print(f"Evaluation results saved to {args.output_dir}")
-
+    logger.info("Evaluation results saved to %s", args.output_dir)
 
 if __name__ == '__main__':
     main()

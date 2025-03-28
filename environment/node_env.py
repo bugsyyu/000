@@ -5,15 +5,18 @@ Key points:
   - We introduce log_level to control output verbosity:
     log_level=1: minimal logs
     log_level=2: print info each episode (or each invalid action)
-    log_level=3: print step-level debug info
+    log_level=3: step-level debug info
   - We unify debug_invalid_placement with log_level.
   - We added a mechanism to end the episode if too many invalid placements occur.
+  - Now we log using Python's logging module for professional & efficient logging.
+    By default, we log to the console, but you can configure a FileHandler or others.
 
 Performance fix:
   - Only call _suggest_initial_nodes() once in the constructor, not in reset().
   - Avoid repeated clustering calls that slow down training when episodes end quickly.
 """
 
+import logging
 import numpy as np
 import gym
 from gym import spaces
@@ -27,6 +30,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.geometry import is_point_in_circle
 from utils.clustering import detect_outliers_dbscan, suggest_intermediate_nodes
+
+# Create a logger for this module
+logger = logging.getLogger(__name__)
 
 class NodePlacementEnv(gym.Env):
     """
@@ -50,6 +56,10 @@ class NodePlacementEnv(gym.Env):
       - _suggest_initial_nodes() is now called once in the constructor.
         This prevents re-doing clustering on every reset() call, which
         was extremely costly if episodes ended quickly.
+
+    Logging improvement:
+      - We use Python's logging instead of print. The user can configure
+        logging handlers/levels externally for professional and efficient logs.
     """
 
     metadata = {'render.modes': ['human']}
@@ -77,7 +87,12 @@ class NodePlacementEnv(gym.Env):
         self.debug_invalid_placement = debug_invalid_placement
         self.log_level = log_level
 
-        # 新增：当单回合非法放置次数超过此阈值，则提前结束
+        # We'll adapt the logging level for our environment's debug messages
+        # but the user can override it by setting a global logger level.
+        # For step-level logs (log_level=3), we can do logger.debug.
+        # For less frequent logs, we do logger.info or warning as needed.
+
+        # threshold of invalid actions per episode，当单回合非法放置次数超过此阈值，则提前结束
         self.max_invalid_placements_per_episode = max_invalid_placements_per_episode
         self.invalid_placement_count = 0  # 计数器；will reset each episode
 
@@ -144,6 +159,10 @@ class NodePlacementEnv(gym.Env):
         self.reward_outlier_valid = 3.0
         self.reward_efficiency = 0.5
 
+        if self.log_level >= 1:
+            logger.info("[NodePlacementEnv] Initialized with max_nodes=%d, min_distance=%.1f, max_distance=%.1f",
+                        self.max_nodes, self.min_distance, self.max_distance)
+
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None):
         """
         Reset the environment to an initial state.
@@ -169,8 +188,8 @@ class NodePlacementEnv(gym.Env):
         # We do NOT re-run _suggest_initial_nodes() here, to avoid heavy clustering each episode
         # self._suggested_nodes = self._suggest_initial_nodes()
         obs = self._get_observation()
-
-        # Return obs and empty info dict to comply with gymnasium/sb3 interface
+        if self.log_level >= 2:
+            logger.info("[NodePlacementEnv] Reset environment. Remaining nodes reset to %d.", self.remaining_nodes)
         return obs, {}
 
     def step(self, action):
@@ -190,6 +209,8 @@ class NodePlacementEnv(gym.Env):
         # Check if we've placed all available nodes
         if self.remaining_nodes <= 0:
             obs = self._get_observation()
+            if self.log_level >= 2:
+                logger.info("[NodePlacementEnv] Step with no remaining nodes => done.")
             return obs, 0.0, True, False, {'reason': 'No more nodes available'}
 
         # Check if node placement is valid
@@ -227,18 +248,26 @@ class NodePlacementEnv(gym.Env):
                 info_extra['reason'] = 'All nodes placed'
 
             obs = self._get_observation()
+
+            if self.log_level >= 3:
+                logger.info("[NodePlacementEnv] Valid placement: x=%.2f, y=%.2f, type=%d => reward=%.2f, remaining=%d",
+                             x, y, node_type, reward, self.remaining_nodes)
+
             info_extra['is_outlier'] = (node_type == 1)
 
         else:
             # Invalid
-            # Only print reason if debug_invalid_placement=True and log_level > 2
-            if self.debug_invalid_placement and self.log_level > 2:
-                print(f"[NodePlacementEnv] Invalid node (x={x:.2f}, y={y:.2f}, type={node_type}): {reason}")
+            reward = validity_reward  # typically negative
+            self.invalid_placement_count += 1
 
-            self.invalid_placement_count += 1  # 累计非法动作
-            reward = validity_reward  # 通常为负值
+            if self.debug_invalid_placement and self.log_level >= 3:
+                logger.info("[NodePlacementEnv] Invalid node (x=%.2f, y=%.2f, type=%d): %s => reward=%.2f ",
+                            x, y, node_type, reason, reward)
 
-            # 如果超过阈值，则结束本回合
+            if self.log_level >= 3:
+                logger.info("[NodePlacementEnv] invalid_placement_count=%d, threshold=%d",
+                             self.invalid_placement_count, self.max_invalid_placements_per_episode)
+
             if self.invalid_placement_count >= self.max_invalid_placements_per_episode:
                 done = True
                 info_extra['reason'] = f"Max invalid placements reached: {self.invalid_placement_count}"
@@ -416,6 +445,8 @@ class NodePlacementEnv(gym.Env):
             np.array(self.intermediate_nodes) if self.intermediate_nodes else np.zeros((0,2))
         ])
         dists = [np.sqrt((x - n[0])**2 + (y - n[1])**2) for n in all_nodes]
+        if len(dists) == 0:
+            return False
         if min(dists) > 50.0:
             return True
         if np.mean(dists) > 100.0:
@@ -439,4 +470,6 @@ class NodePlacementEnv(gym.Env):
             max_intermediate_nodes=self.max_nodes,
             isolation_threshold=100.0
         )
+        if self.log_level >= 2:
+            logger.info("[NodePlacementEnv] Generated %d suggested nodes via clustering.", len(suggested_nodes))
         return suggested_nodes

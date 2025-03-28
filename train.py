@@ -5,8 +5,10 @@ We define a CustomLoggingCallback to control:
 - log_level=1: minimal logs (episodes overall)
 - log_level=2: per-episode logs
 - log_level=3: per-step logs
+And we use Python logging instead of print.
 """
 
+import logging
 import os
 import argparse
 import numpy as np
@@ -24,9 +26,10 @@ from config.latlon_config import latlon_config
 from utils.coordinate_transform import transform_config_to_cartesian
 from environment.node_env import NodePlacementEnv
 from environment.graph_env import GraphConstructionEnv
-from utils.visualization import plot_airspace_network, plot_training_progress, plot_paths_between_points
+from utils.visualization import plot_airspace_network, plot_training_progress
 from environment.utils import evaluate_network, find_shortest_paths
 
+logger = logging.getLogger(__name__)
 # ------------------- Custom callback with log_level -------------------
 class CustomLoggingCallback(BaseCallback):
     """
@@ -65,7 +68,7 @@ class CustomLoggingCallback(BaseCallback):
 
     def _on_training_start(self) -> None:
         if self.log_level >= 1:
-            print("[CustomLoggingCallback] Training start...")
+            logger.info("[CustomLoggingCallback] Training start...")
 
     def _on_step(self) -> bool:
         # Each time we step in the environment
@@ -78,31 +81,21 @@ class CustomLoggingCallback(BaseCallback):
         r = rewards[0]
         d = dones[0]
         a = actions[0] if len(actions.shape) > 0 else actions
-
         self.current_episode_reward += r
         self.current_episode_length += 1
-
         if self.log_level >= 3:
             # Step-level logs
-            print(f"[log_level=3][Step] Episode {self.episode_count} Step {self.current_episode_length} "
-                  f"Action={a} Reward={r:.3f} Done={d}")
-
+            logger.debug("[log_level=3][Step] Episode %d Step %d Action=%s Reward=%.3f Done=%s",
+                         self.episode_count, self.current_episode_length, str(a), r, d)
         if d:
-            # Episode just ended
             self.episode_rewards.append(self.current_episode_reward)
             self.episode_lengths.append(self.current_episode_length)
             self.episode_count += 1
-
             if self.log_level >= 2:
-                # Per-episode logs
-                print(f"[log_level=2][Episode End] Episode={self.episode_count} "
-                      f"Length={self.current_episode_length} Reward={self.current_episode_reward:.3f}")
-
-            # reset
+                logger.info("[log_level=2][Episode End] Episode=%d Length=%d Reward=%.3f",
+                            self.episode_count, self.current_episode_length, self.current_episode_reward)
             self.current_episode_reward = 0
             self.current_episode_length = 0
-
-            # Optionally save progress
             if self.save_path is not None:
                 if self.episode_count % self.save_freq == 0:
                     # E.g. we can save a partial plot or something
@@ -118,7 +111,7 @@ class CustomLoggingCallback(BaseCallback):
         if self.log_level == 1:
             # Minimal logs at iteration level
             # e.g. show how many episodes so far
-            print(f"[log_level=1] Currently finished {self.episode_count} episodes so far...")
+            logger.info("[log_level=1] Currently finished %d episodes so far...", self.episode_count)
 
     def _save_progress(self):
         """
@@ -127,9 +120,10 @@ class CustomLoggingCallback(BaseCallback):
         """
         pass  # you could replicate the logic in the old trainingprogresscallback
 
+
     def _on_training_end(self) -> None:
         if self.log_level >= 1:
-            print(f"[CustomLoggingCallback] Training ended. Total episodes finished: {self.episode_count}")
+            logger.info("[CustomLoggingCallback] Training ended. Total episodes finished: %d", self.episode_count)
 
 
 # ------------------- NodePlacement training function -------------------
@@ -146,7 +140,7 @@ def train_node_placement(
     seed: int = 42,
     max_nodes: int = 30,
     total_timesteps: int = 1000000,
-    log_level: int = 1  # <--- new param
+    log_level: int = 1
 ) -> Tuple[PPO, Tuple[np.ndarray, List[int]]]:
     """
     Train the node placement model.
@@ -183,6 +177,7 @@ def train_node_placement(
             max_nodes=max_nodes,
             min_distance=10.0,
             max_distance=150.0,
+            debug_invalid_placement=True,
             log_level=log_level
         ))
 
@@ -219,6 +214,7 @@ def train_node_placement(
         seed=seed
     )
 
+    logger.info("Starting NodePlacementEnv training with total_timesteps=%d ...", total_timesteps)
     model.learn(
         total_timesteps=total_timesteps,
         callback=[custom_log_callback, checkpoint_callback]  # pass our custom logger
@@ -226,16 +222,15 @@ def train_node_placement(
 
     # Save final model
     model.save(os.path.join(output_dir, 'node_placement', 'final_model'))
+    logger.info("NodePlacementEnv model saved at: %s", os.path.join(output_dir, 'node_placement', 'final_model'))
 
-    # =============== Run a quick evaluation to place nodes (unchanged) ===============
-    print("Running evaluation with improved logic to avoid getting stuck...")
-
-    # Create evaluation environment
+    logger.info("Running node placement evaluation (quick test)...")
     eval_env = NodePlacementEnv(
         cartesian_config=cartesian_config,
         max_nodes=max_nodes,
         min_distance=10.0,
         max_distance=150.0,
+        debug_invalid_placement=True,
         log_level=log_level
     )
 
@@ -263,7 +258,7 @@ def train_node_placement(
 
             # If we've tried the same action too many times, add randomness
             if repeated_action_count >= max_repeat_tries:
-                print(f"Action {action} repeated {repeated_action_count} times, adding randomness...")
+                logger.warning("Action repeated %d times, injecting randomness...", repeated_action_count)
                 import math
                 import random as pyrand
                 x_range = eval_env.x_max - eval_env.x_min
@@ -295,26 +290,22 @@ def train_node_placement(
             last_action = action.copy()
 
         # Take step in environment
-        step_result = eval_env.step(action)
-        obs, reward, done, _, info = step_result
+        obs, reward, done, _, info = eval_env.step(action)
         step_count += 1
 
         # If this was a valid placement, record it
         if 'reason' in info and info['reason'] == 'Valid placement':
             placed_nodes += 1
-            print(f"Successfully placed node {placed_nodes}/{max_nodes}")
-
+            logger.info("Successfully placed node %d/%d", placed_nodes, max_nodes)
             # Reset the repeated action counter after a successful placement
             repeated_action_count = 0
 
             # If we've placed all nodes, we're done
             if placed_nodes >= max_nodes:
-                print("Placed all nodes successfully")
+                logger.info("Placed all nodes successfully")
                 break
 
-    print(f"Evaluation completed after {step_count} steps with {placed_nodes} nodes placed")
-
-    # Get the final nodes
+    logger.info("Evaluation completed after %d steps with %d nodes placed", step_count, placed_nodes)
     final_nodes, final_node_types = eval_env.get_full_nodes()
 
     # Save the nodes
@@ -354,7 +345,7 @@ def train_graph_construction(
     seed: int = 42,
     max_edges: int = 100,
     total_timesteps: int = 1000000,
-    log_level: int = 1  # <--- new param
+    log_level: int = 1
 ) -> Tuple[PPO, List[Tuple[int, int]]]:
     """
     Train the graph construction model.
@@ -398,7 +389,8 @@ def train_graph_construction(
         frontline_indices=frontline_indices,
         airport_indices=airport_indices,
         max_edges=max_edges,
-        max_angle_deg=80.0
+        max_angle_deg=80.0,
+        log_level=log_level
     )
 
     # Test reset to make sure it works - extract just the observation
@@ -416,7 +408,8 @@ def train_graph_construction(
             frontline_indices=frontline_indices,
             airport_indices=airport_indices,
             max_edges=max_edges,
-            max_angle_deg=80.0
+            max_angle_deg=80.0,
+            log_level=log_level
         ))
 
     # Create vectorized environments using DummyVecEnv instead of SubprocVecEnv
@@ -430,7 +423,6 @@ def train_graph_construction(
         save_freq=50,
         verbose=1
     )
-
     checkpoint_callback = CheckpointCallback(
         save_freq=n_steps * 10,
         save_path=os.path.join(output_dir, 'graph_construction', 'checkpoints'),
@@ -451,6 +443,7 @@ def train_graph_construction(
         seed=seed
     )
 
+    logger.info("Starting GraphConstructionEnv training with total_timesteps=%d ...", total_timesteps)
     model.learn(
         total_timesteps=total_timesteps,
         callback=[custom_log_callback, checkpoint_callback]
@@ -458,10 +451,10 @@ def train_graph_construction(
 
     # Save final model
     model.save(os.path.join(output_dir, 'graph_construction', 'final_model'))
+    logger.info("GraphConstructionEnv model saved at: %s", os.path.join(output_dir, 'graph_construction', 'final_model'))
 
     # ============= 下面是“训练后自动执行评估”阶段  =============
-    print("Running graph construction evaluation...")
-
+    logger.info("Running graph construction evaluation (quick test) ...")
     # Create evaluation environment
     eval_env = GraphConstructionEnv(
         nodes=nodes,
@@ -471,12 +464,11 @@ def train_graph_construction(
         frontline_indices=frontline_indices,
         airport_indices=airport_indices,
         max_edges=max_edges,
-        max_angle_deg=80.0
+        max_angle_deg=80.0,
+        log_level=log_level
     )
-
     reset_result = eval_env.reset(seed=seed+100)
     obs = reset_result[0]
-
     max_steps = 100
     step_count = 0
     done = False
@@ -495,19 +487,16 @@ def train_graph_construction(
 
                 # If we've tried the same action too many times, try random action
                 if repeated_action_count >= max_repeat_tries:
-                    print(f"Action {action} repeated {repeated_action_count} times, trying random action...")
+                    logger.warning("Action %d repeated %d times, using random edge...", action, repeated_action_count)
                     a = eval_env.action_space.sample()
                     action = a
                     repeated_action_count = 0
             else:
                 repeated_action_count = 0
                 last_action = action
-
             # Take step in environment
-            step_result = eval_env.step(action)
-            obs, reward, done, _, info = step_result
+            obs, reward, done, _, info = eval_env.step(action)
             step_count += 1
-
             if 'reason' not in info or info['reason'] != 'action index out of range':
                 added_edges += 1
                 #print(f"Added edge {added_edges}/{max_edges}")
@@ -515,18 +504,16 @@ def train_graph_construction(
             # If we've reached connectivity goal, we're done
             if 'num_connected_pairs' in info and 'total_pairs' in info:
                 if info['num_connected_pairs'] == info['total_pairs']:
-                    print(f"All pairs connected! ({info['num_connected_pairs']}/{info['total_pairs']})")
+                    logger.info("All pairs connected! (%d/%d)", info['num_connected_pairs'], info['total_pairs'])
                     break
     except Exception as e:
-        print(f"Error during evaluation: {e}")
+        logger.error("Error during evaluation: %s", str(e))
 
-    print(f"Graph evaluation completed after {step_count} steps with {added_edges} edges added")
-
+    logger.info("Graph evaluation completed after %d steps with %d edges added", step_count, added_edges)
     # 拿到最终网络
     _, _, final_edges = eval_env.get_network()
-
     # 打印连通信息
-    print("[Auto-Eval] Checking final pairwise connectivity:")
+    logger.info("[Auto-Eval] Checking final pairwise connectivity:")
     all_paths, success_flags = find_shortest_paths(
         nodes,
         final_edges,
@@ -538,15 +525,15 @@ def train_graph_construction(
     for f_ in frontline_indices:
         for a_ in airport_indices:
             status_ = "CONNECTED" if success_flags[idx_] else "NOT CONNECTED"
-            print(f"  Pair(frontline={f_}, airport={a_}): {status_}")
+            logger.info("  Pair(frontline=%d, airport=%d): %s", f_, a_, status_)
             idx_ += 1
     connected_count = sum(success_flags)
     total_count = len(success_flags)
-    print(f"[Auto-Eval] connected pairs: {connected_count}/{total_count}")
+    logger.info("[Auto-Eval] connected pairs: %d/%d", connected_count, total_count)
     if connected_count == total_count:
-        print("[Auto-Eval] => All pairs are connected! ✅")
+        logger.info("[Auto-Eval] => All pairs are connected! ✅")
     else:
-        print("[Auto-Eval] => Not all pairs connected. ❌")
+        logger.info("[Auto-Eval] => Not all pairs connected. ❌")
 
     # 保存 edges
     np.savez(
@@ -565,7 +552,7 @@ def train_graph_construction(
                 if key not in ['paths', 'adi_traversal_metrics', 'angle_metrics']:
                     f.write(f"{key}: {value}\n")
     except Exception as e:
-        print(f"Warning: Error evaluating network: {e}")
+        logger.error("Warning: Error evaluating network: %s", str(e))
 
     try:
         # Visualize the network
@@ -580,10 +567,9 @@ def train_graph_construction(
         plt.savefig(os.path.join(output_dir, 'graph_construction', 'final_network.png'))
         plt.close(fig)
     except Exception as e:
-        print(f"Warning: Error visualizing network: {e}")
+        logger.error("Warning: Error visualizing network: %s", str(e))
 
     return model, final_edges
-
 
 def main():
     """
@@ -598,17 +584,22 @@ def main():
     parser.add_argument('--max_nodes', type=int, default=30, help='Maximum number of intermediate nodes')
     parser.add_argument('--max_edges', type=int, default=100, help='Maximum number of edges')
     parser.add_argument('--n_envs', type=int, default=4, help='Number of parallel environments for node placement')
-
-    # New argument for log_level
-    parser.add_argument('--log_level', type=int, default=1, help='Logging verbosity level (1=minimal,2=episode,3=step)')
+    parser.add_argument('--log_level', type=int, default=1, help='Logging verbosity level (1=minimal,2=info,3=debug)')
 
     args = parser.parse_args()
+
+    # Example of configuring the root logger
+    logging.basicConfig(
+        level=logging.INFO,
+        # level=logging.DEBUG if args.log_level >= 3 else (logging.INFO if args.log_level == 2 else logging.WARNING),
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+    )
 
     # Transform latitude-longitude config to Cartesian coordinates
     cartesian_config = transform_config_to_cartesian(latlon_config)
 
     # Train node placement model
-    print("Training node placement model...")
+    logger.info("Training node placement model...")
     node_model, (nodes, node_types) = train_node_placement(
         cartesian_config=cartesian_config,
         output_dir=args.output_dir,
@@ -617,12 +608,12 @@ def main():
         max_nodes=args.max_nodes,
         total_timesteps=args.node_timesteps,
         n_envs=args.n_envs,
-        log_level=args.log_level  # pass
+        log_level=args.log_level
     )
-    print(f"Node placement complete. Generated {len(nodes)} nodes.")
+    logger.info("Node placement complete. Generated %d nodes.", len(nodes))
 
     # Train graph construction model
-    print("Training graph construction model...")
+    logger.info("Training graph construction model...")
     graph_model, edges = train_graph_construction(
         cartesian_config=cartesian_config,
         nodes=nodes,
@@ -633,9 +624,9 @@ def main():
         max_edges=args.max_edges,
         total_timesteps=args.graph_timesteps,
         n_envs=1,
-        log_level=args.log_level  # pass
+        log_level=args.log_level
     )
-    print(f"Graph construction complete. Generated {len(edges)} edges.")
+    logger.info("Graph construction complete. Generated %d edges.", len(edges))
 
     # Save final results (both nodes and edges)
     np.savez(
@@ -644,8 +635,7 @@ def main():
         node_types=node_types,
         edges=np.array(edges)
     )
-    print(f"Final results saved to {args.output_dir}/final_network.npz")
-
+    logger.info("Final results saved to %s", os.path.join(args.output_dir, 'final_network.npz'))
 
 if __name__ == '__main__':
     main()

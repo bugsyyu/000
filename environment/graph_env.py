@@ -2,6 +2,7 @@
 Graph construction environment for reinforcement learning.
 """
 
+import logging
 import numpy as np
 import gym
 from gym import spaces
@@ -25,8 +26,10 @@ from environment.utils import (
     calculate_connectivity_score,
     evaluate_network,
     extract_features_for_gnn,
-    find_shortest_paths  # ← 新增 import，用于打印每对的连通情况
+    find_shortest_paths  # 用于打印每对的连通情况
 )
+
+logger = logging.getLogger(__name__)
 
 class GraphConstructionEnv(gym.Env):
     """
@@ -50,7 +53,8 @@ class GraphConstructionEnv(gym.Env):
             airport_indices: List[int],
             max_edges: int = 100,
             max_angle_deg: float = 80.0,
-            render_mode: str = None
+            render_mode: str = None,
+            log_level: int = 1
     ):
         super(GraphConstructionEnv, self).__init__()
 
@@ -63,6 +67,9 @@ class GraphConstructionEnv(gym.Env):
         self.max_edges = max_edges
         self.max_angle_deg = max_angle_deg
         self.render_mode = render_mode
+
+        # optional: store log_level
+        self.log_level = log_level
 
         self.num_nodes = len(nodes)
         self.num_frontline = len(frontline_indices)
@@ -111,13 +118,16 @@ class GraphConstructionEnv(gym.Env):
             )
         })
 
-        # 各种奖励参数
+        # reward related
         self.reward_edge_added = 1.0
         self.reward_edge_invalid = -1.0
         self.reward_connectivity_improvement = 5.0
         self.reward_adi_traversal = 2.0
         self.reward_danger_penalty_factor = -1.0
         self.reward_completion = 20.0
+
+        if self.log_level >= 1:
+            logger.info("[GraphConstructionEnv] Initialized with %d nodes, max_edges=%d", self.num_nodes, self.max_edges)
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None):
         if seed is not None:
@@ -127,6 +137,8 @@ class GraphConstructionEnv(gym.Env):
         self._update_valid_potential_edges()
 
         obs = self._get_observation()
+        if self.log_level >= 2:
+            logger.info("[GraphConstructionEnv] Reset. Potential edges count=%d", len(self.valid_potential_edges))
         return obs, {}
 
     def step(self, action: int):
@@ -137,6 +149,8 @@ class GraphConstructionEnv(gym.Env):
         # 1) 如果 action 超出当前可用边数量，则视为非法动作
         if action >= len(self.valid_potential_edges):
             obs = self._get_observation()
+            if self.log_level >= 3:
+                logger.debug("[GraphConstructionEnv] Action out of range => invalid edge action=%d", action)
             return obs, self.reward_edge_invalid, False, False, {'reason': 'action index out of range'}
 
         # 2) 取到要添加的边
@@ -160,6 +174,8 @@ class GraphConstructionEnv(gym.Env):
         if not is_valid:
             # 理论上不会进入这里，但以防万一
             obs = self._get_observation()
+            if self.log_level >= 3:
+                logger.debug("[GraphConstructionEnv] Chosen edge is invalid => %s", reason)
             return obs, self.reward_edge_invalid, False, False, {'reason': reason}
 
         # 4) 添加边
@@ -204,6 +220,7 @@ class GraphConstructionEnv(gym.Env):
 
         # 如果 done=True，打印每个前沿点-机场对是否连通，方便最直观判断
         if done:
+            # print connectivity
             all_paths, success_flags = find_shortest_paths(
                 self.nodes,
                 self.edges,
@@ -211,17 +228,21 @@ class GraphConstructionEnv(gym.Env):
                 self.airport_indices,
                 node_types=self.node_types
             )
-            print("[GraphConstructionEnv] DONE! Pairwise connectivity details:")
+            if self.log_level >= 2:
+                logger.info("[GraphConstructionEnv] DONE! Pairwise connectivity details:")
             idx = 0
             for f in self.frontline_indices:
                 for a in self.airport_indices:
                     status = "CONNECTED" if success_flags[idx] else "NOT CONNECTED"
-                    print(f"  Pair(frontline={f}, airport={a}): {status}")
+                    if self.log_level >= 2:
+                        logger.info("   Pair(frontline=%d, airport=%d): %s", f, a, status)
                     idx += 1
-            if num_connected_pairs == total_pairs:
-                print("=> All pairs are connected! ✅")
-            else:
-                print(f"=> Not all pairs connected. (connected {num_connected_pairs}/{total_pairs}) ❌")
+                # end for
+            if num_connected_pairs == total_pairs and self.log_level >= 2:
+                logger.info("=> All pairs are connected! ✅")
+            elif self.log_level >= 2:
+                logger.info("=> Not all pairs connected. (connected %d/%d) ❌",
+                            num_connected_pairs, total_pairs)
 
         return obs, reward, done, False, info
 
@@ -271,7 +292,6 @@ class GraphConstructionEnv(gym.Env):
             padded_edge_indices = np.zeros((2, self.max_edges), dtype=np.int64)
             if num_edges > 0:
                 padded_edge_indices[:, :num_edges] = edge_indices
-
             feat_dim = edge_features.shape[1] if edge_features.ndim > 1 else (1 + len(self.adi_zones) + 1)
             padded_edge_features = np.zeros((self.max_edges, feat_dim), dtype=np.float32)
             if num_edges > 0:
@@ -348,7 +368,6 @@ class GraphConstructionEnv(gym.Env):
         """
         i, j = edge
         reward = self.reward_edge_added
-
         start_point = tuple(self.nodes[i])
         end_point = tuple(self.nodes[j])
         line = (start_point, end_point)
