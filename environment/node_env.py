@@ -1,19 +1,12 @@
 """
-Node placement environment for reinforcement learning, supporting log_level for debug prints.
+Node placement environment (simplified) with improved "strategic" node placement logic.
 
-Key points:
-  - We introduce log_level to control output verbosity:
-    log_level=1: minimal logs
-    log_level=2: print info each episode (or each invalid action)
-    log_level=3: step-level debug info
-  - We unify debug_invalid_placement with log_level.
-  - We added a mechanism to end the episode if too many invalid placements occur.
-  - Now we log using Python's logging module for professional & efficient logging.
-    By default, we log to the console, but you can configure a FileHandler or others.
+这里在 reset() 时基于借鉴的“改进节点放置算法”一次性确定所有中间节点，
+然后在 step() 中直接返回 done=True，不再进行深度强化学习式的逐步搜索。
+这样可快速完成节点放置，并避免反复采样造成的大量无效动作。
 
-Performance fix:
-  - Only call _suggest_initial_nodes() once in the constructor, not in reset().
-  - Avoid repeated clustering calls that slow down training when episodes end quickly.
+具体逻辑写在 _place_nodes_geometrically() 中，
+参考了此前给出的“place_strategic_nodes”思路，并做了适配与简化。
 """
 
 import logging
@@ -23,43 +16,34 @@ from gym import spaces
 from typing import List, Tuple, Dict, Any, Optional
 import sys
 import os
-import copy
+import math
 
-# Add parent directory to path
+# Add parent directory to path (so we can import from ../utils if needed)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.geometry import is_point_in_circle
-from utils.clustering import detect_outliers_dbscan, suggest_intermediate_nodes
+from utils.geometry import is_point_in_circle, distance_point_to_point
 
-# Create a logger for this module
 logger = logging.getLogger(__name__)
 
 class NodePlacementEnv(gym.Env):
     """
-    Environment for placing intermediate nodes in the airspace network.
+    Environment for placing intermediate nodes with an improved deterministic strategy
+    (rather than random RL exploration).
 
-    State space:
-        - Fixed nodes (frontline and airport points)
-        - Currently placed intermediate nodes
-        - ADI zone parameters
-        - Number of remaining nodes to place
+    Use-cases:
+      - If you prefer a guaranteed geometric approach to place nodes between frontlines and airports,
+        near ADI outer rings, and in some random fallback, you can do so here.
+      - We unify everything into the reset() method => once environment is reset, all nodes are placed.
+      - Then step() just returns done=True, effectively skipping multi-step RL.
 
-    Action space:
-        - Continuous: (x, y, node_type)
-          node_type: 0 for common node, 1 for outlier node
+    Node Types:
+      0: frontline
+      1: airport
+      2: normal intermediate
+      3: special intermediate
 
-    We add log_level and debug_invalid_placement to unify output control:
-      - debug_invalid_placement: master switch to enable/disable printing invalid reasons at all
-      - log_level: if debug_invalid_placement=True, only print reasons if log_level>=2
-
-    Performance improvement:
-      - _suggest_initial_nodes() is now called once in the constructor.
-        This prevents re-doing clustering on every reset() call, which
-        was extremely costly if episodes ended quickly.
-
-    Logging improvement:
-      - We use Python's logging instead of print. The user can configure
-        logging handlers/levels externally for professional and efficient logs.
+    Basic usage remains the same as the old RL environment. But effectively
+    the "training" on this env will finish quickly since there's no multi-step flow.
     """
 
     metadata = {'render.modes': ['human']}
@@ -68,8 +52,8 @@ class NodePlacementEnv(gym.Env):
         self,
         cartesian_config: Dict[str, Any],
         max_nodes: int = 30,
-        min_distance: float = 10.0,   # Minimum distance (km) between new node and existing node
-        max_distance: float = 150.0,  # Maximum distance for valid node placement
+        min_distance: float = 10.0,
+        max_distance: float = 150.0,
         render_mode: str = None,
         debug_invalid_placement: bool = True,
         log_level: int = 1,
@@ -83,34 +67,22 @@ class NodePlacementEnv(gym.Env):
         self.max_distance = max_distance
         self.render_mode = render_mode
 
-        # Debug/Logging control
         self.debug_invalid_placement = debug_invalid_placement
         self.log_level = log_level
 
-        # We'll adapt the logging level for our environment's debug messages
-        # but the user can override it by setting a global logger level.
-        # For step-level logs (log_level=3), we can do logger.debug.
-        # For less frequent logs, we do logger.info or warning as needed.
-
-        # threshold of invalid actions per episode，当单回合非法放置次数超过此阈值，则提前结束
         self.max_invalid_placements_per_episode = max_invalid_placements_per_episode
-        self.invalid_placement_count = 0  # 计数器；will reset each episode
 
-        # Extract data from cartesian_config
+        # Extract fixed (frontline + airport) nodes
         self.frontline_points = np.array([
             [point['x'], point['y']] for point in cartesian_config['frontline']
         ])
         self.airport_points = np.array([
             [airport['x'], airport['y']] for airport in cartesian_config['airports']
         ])
-        self.adi_zones = cartesian_config['adi_zones']
-        self.danger_zones = cartesian_config['danger_zones']
-
-        # Combine frontline and airport points as fixed nodes
         self.fixed_nodes = np.vstack([self.frontline_points, self.airport_points])
         self.num_fixed_nodes = len(self.fixed_nodes)
 
-        # Compute spatial bounds
+        # For reference only (e.g. bounding the random fallback):
         all_x = np.concatenate([self.frontline_points[:, 0], self.airport_points[:, 0]])
         all_y = np.concatenate([self.frontline_points[:, 1], self.airport_points[:, 1]])
         x_min, x_max = np.min(all_x), np.max(all_x)
@@ -119,22 +91,19 @@ class NodePlacementEnv(gym.Env):
         self.x_min, self.x_max = x_min - padding, x_max + padding
         self.y_min, self.y_max = y_min - padding, y_max + padding
 
-        # Action space = (x, y, node_type)
-        # node_type is in [0,1], but we keep the box continuous in [0,1]
+        self.adi_zones = cartesian_config['adi_zones']
+        self.danger_zones = cartesian_config['danger_zones']
+
+        # Action space: still a 3D Box for (x,y,node_type), but effectively unused
         self.action_space = spaces.Box(
             low=np.array([self.x_min, self.y_min, 0]),
             high=np.array([self.x_max, self.y_max, 1]),
             dtype=np.float32
         )
 
-        # We'll flatten our observation:
-        # - fixed_nodes (n_fixed * 3): [x, y, is_frontline?]
-        # - intermediate_nodes (max_nodes * 3): [x, y, is_outlier?]
-        # - adi_zones (#adi_zones * 4): [center_x, center_y, inner_radius, outer_radius]
-        # - 1 extra for remaining_nodes
+        # We keep the same shape for observation as the old approach, for SB3 compatibility
         num_adi_zones = len(self.adi_zones)
-        obs_size = (self.num_fixed_nodes * 3) + (self.max_nodes * 3) + (num_adi_zones * 4) + 1
-
+        obs_size = (self.num_fixed_nodes * 3) + (max_nodes * 3) + (num_adi_zones * 4) + 1
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -142,334 +111,270 @@ class NodePlacementEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Initialize state
         self.intermediate_nodes = []
         self.intermediate_node_types = []
         self.remaining_nodes = self.max_nodes
 
-        # For clustering
-        # IMPORTANT: We do it once here, not in reset(). That was the performance issue previously.
-        # self._suggested_nodes = None
-        self._suggested_nodes = self._suggest_initial_nodes()
-
-        # Rewards
-        self.reward_node_valid = 1.0
-        self.reward_node_invalid = -1.0
-        self.reward_node_near_adi = 2.0
-        self.reward_outlier_valid = 3.0
-        self.reward_efficiency = 0.5
-
         if self.log_level >= 1:
-            logger.info("[NodePlacementEnv] Initialized with max_nodes=%d, min_distance=%.1f, max_distance=%.1f",
-                        self.max_nodes, self.min_distance, self.max_distance)
+            logger.info(
+                "[NodePlacementEnv] Using a strategic deterministic placement approach. "
+                "max_nodes=%d, min_distance=%.1f, max_distance=%.1f",
+                self.max_nodes, self.min_distance, self.max_distance
+            )
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None):
-        """
-        Reset the environment to an initial state.
-
-        Args:
-            seed: Random seed
-            options: Additional options
-
-        Returns:
-            Initial observation and reset info dict
-        """
         if seed is not None:
             np.random.seed(seed)
 
-        # Clear intermediate nodes
-        self.intermediate_nodes = []
-        self.intermediate_node_types = []
-        self.remaining_nodes = self.max_nodes
+        # Perform the strategic/deterministic node placement
+        self._place_nodes_geometrically()
 
-        # Reset非法动作计数器
-        self.invalid_placement_count = 0
+        # We'll consider that we've placed all nodes at once
+        self.remaining_nodes = 0
 
-        # We do NOT re-run _suggest_initial_nodes() here, to avoid heavy clustering each episode
-        # self._suggested_nodes = self._suggest_initial_nodes()
         obs = self._get_observation()
         if self.log_level >= 2:
-            logger.info("[NodePlacementEnv] Reset environment. Remaining nodes reset to %d.", self.remaining_nodes)
+            logger.info(
+                "[NodePlacementEnv] Reset => placed %d intermediate nodes. (limit=%d)",
+                len(self.intermediate_nodes), self.max_nodes
+            )
         return obs, {}
 
     def step(self, action):
         """
-        Take a step in the environment.
-
-        Args:
-            action: (x, y, node_type) where node_type is 0 for common, 1 for outlier
-
-        Returns:
-            (observation, reward, done, truncated, info)
+        We skip step-by-step logic: immediately done.
         """
-        # Extract action components
-        x, y, node_type_float = action
-        node_type = int(round(node_type_float))
-
-        # Check if we've placed all available nodes
-        if self.remaining_nodes <= 0:
-            obs = self._get_observation()
-            if self.log_level >= 2:
-                logger.info("[NodePlacementEnv] Step with no remaining nodes => done.")
-            return obs, 0.0, True, False, {'reason': 'No more nodes available'}
-
-        # Check if node placement is valid
-        is_valid, validity_reward, reason = self._check_node_validity(x, y)
-
-        done = False
+        obs = self._get_observation()
+        reward = 0.0
+        done = True
         truncated = False
-        info_extra = {}
+        info = {'reason': 'Nodes placed in reset()'}
 
-        if is_valid:
-            # Valid placement
-            self.intermediate_nodes.append([x, y])
-            self.intermediate_node_types.append(node_type)
-            self.remaining_nodes -= 1
-
-            # Additional logic
-            reward = validity_reward
-
-            # Efficiency reward if near suggested node
-            if self._suggested_nodes is not None and len(self._suggested_nodes) > 0:
-                for suggested_node in self._suggested_nodes:
-                    dist = np.sqrt((x - suggested_node[0])**2 + (y - suggested_node[1])**2)
-                    if dist < 20.0:
-                        reward += self.reward_efficiency
-                        break
-
-            # Extra reward for outlier node if truly outlier region
-            if node_type == 1:
-                if self._is_outlier_region(x, y):
-                    reward += self.reward_outlier_valid
-
-            # If we've used up all placements, we are done
-            if self.remaining_nodes <= 0:
-                done = True
-                info_extra['reason'] = 'All nodes placed'
-
-            obs = self._get_observation()
-
-            if self.log_level >= 3:
-                logger.info("[NodePlacementEnv] Valid placement: x=%.2f, y=%.2f, type=%d => reward=%.2f, remaining=%d",
-                             x, y, node_type, reward, self.remaining_nodes)
-
-            info_extra['is_outlier'] = (node_type == 1)
-
-        else:
-            # Invalid
-            reward = validity_reward  # typically negative
-            self.invalid_placement_count += 1
-
-            if self.debug_invalid_placement and self.log_level >= 3:
-                logger.info("[NodePlacementEnv] Invalid node (x=%.2f, y=%.2f, type=%d): %s => reward=%.2f ",
-                            x, y, node_type, reason, reward)
-
-            if self.log_level >= 3:
-                logger.info("[NodePlacementEnv] invalid_placement_count=%d, threshold=%d",
-                             self.invalid_placement_count, self.max_invalid_placements_per_episode)
-
-            if self.invalid_placement_count >= self.max_invalid_placements_per_episode:
-                done = True
-                info_extra['reason'] = f"Max invalid placements reached: {self.invalid_placement_count}"
-
-            obs = self._get_observation()
-
-        return obs, reward, done, truncated, info_extra
+        return obs, reward, done, truncated, info
 
     def render(self, mode='human'):
-        """
-        Render the environment.
-        """
-        # Rendering is handled externally with visualization.py
         pass
 
     def close(self):
-        """
-        Close the environment.
-        """
         pass
 
     def get_full_nodes(self) -> Tuple[np.ndarray, List[int]]:
         """
-        Get all nodes (fixed + intermediate) and their types.
-
-        Returns:
-            Tuple of (nodes, node_types)
+        Return (nodes, node_types).
+          0: frontline
+          1: airport
+          2: normal intermediate
+          3: special intermediate
         """
-        # Combine fixed and intermediate nodes
         all_nodes = np.vstack([
             self.fixed_nodes,
-            np.array(self.intermediate_nodes) if self.intermediate_nodes else np.zeros((0,2))
+            np.array(self.intermediate_nodes) if self.intermediate_nodes else np.zeros((0, 2))
         ])
 
-        # Create node types list
-        # 0: frontline, 1: airport, 2: common intermediate, 3: outlier intermediate
-        node_types = []
-
-        # Add fixed node types
+        # Build node types
         num_frontline = len(self.frontline_points)
         num_airports = len(self.airport_points)
-        node_types.extend([0]*num_frontline)  # 0=frontline
-        node_types.extend([1]*num_airports)   # 1=airport
-
-        # Add intermediate node types
-        for nt in self.intermediate_node_types:
-            node_types.append(2+nt)  # 2=common,3=outlier
+        node_types = [0] * num_frontline + [1] * num_airports
+        for t in self.intermediate_node_types:
+            node_types.append(t)
 
         return all_nodes, node_types
 
     def _get_observation(self) -> np.ndarray:
         """
-        Get the current observation.
-
-        Returns:
-            Observation array
+        Flatten everything to match the old observation shape.
         """
-        # Prepare fixed nodes section
-        fixed_nodes_obs = np.zeros((self.num_fixed_nodes, 3))
-
-        # Add frontline points
+        fixed_obs = np.zeros((self.num_fixed_nodes, 3))
         num_frontline = len(self.frontline_points)
-        fixed_nodes_obs[:num_frontline, :2] = self.frontline_points
-        fixed_nodes_obs[:num_frontline, 2] = 1.0  # is_frontline flag
+        # Mark frontline
+        fixed_obs[:num_frontline, :2] = self.frontline_points
+        fixed_obs[:num_frontline, 2] = 1.0
+        # Mark airports
+        fixed_obs[num_frontline:, :2] = self.airport_points
+        fixed_obs[num_frontline:, 2] = 0.0
 
-        # Add airport points
-        fixed_nodes_obs[num_frontline:, :2] = self.airport_points
-        fixed_nodes_obs[num_frontline:, 2] = 0.0  # airport
+        interm_obs = np.zeros((self.max_nodes, 3))
+        n_interm = len(self.intermediate_nodes)
+        if n_interm > 0:
+            interm_obs[:n_interm, :2] = np.array(self.intermediate_nodes)
+            interm_obs[:n_interm, 2] = np.array(self.intermediate_node_types)
 
-        # Prepare intermediate nodes section (padded with zeros)
-        intermediate_obs = np.zeros((self.max_nodes, 3))
-        num_intermediate = len(self.intermediate_nodes)
-        if num_intermediate > 0:
-            intermediate_obs[:num_intermediate, :2] = np.array(self.intermediate_nodes)
-            intermediate_obs[:num_intermediate, 2] = np.array(self.intermediate_node_types)
-
-        # Prepare ADI zones section
         adi_obs = np.zeros((len(self.adi_zones), 4))
         for i, zone in enumerate(self.adi_zones):
             adi_obs[i, 0] = zone['center_x']
             adi_obs[i, 1] = zone['center_y']
-            adi_obs[i, 2] = zone['radius']  # Inner radius
-            adi_obs[i, 3] = zone['epsilon']  # Outer radius
+            adi_obs[i, 2] = zone['radius']
+            adi_obs[i, 3] = zone['epsilon']
 
-        # Prepare remaining nodes counter
         counter_obs = np.array([self.remaining_nodes])
 
-        # Combine all observation components
         obs = np.concatenate([
-            fixed_nodes_obs.flatten(),
-            intermediate_obs.flatten(),
+            fixed_obs.flatten(),
+            interm_obs.flatten(),
             adi_obs.flatten(),
             counter_obs
-        ])
+        ]).astype(np.float32)
         return obs
 
-    def _check_node_validity(self, x: float, y: float) -> Tuple[bool, float, str]:
+    def _place_nodes_geometrically(self):
         """
-        Check if a node placement is valid.
+        Core logic for strategic deterministic placement.
 
-        Args:
-            x: X-coordinate of the node
-            y: Y-coordinate of the node
-
-        Returns:
-            Tuple of (is_valid, reward, reason)
+        参考了 `place_strategic_nodes()` 的思路:
+          1) 在 ADI 外圈附近放置一批节点。
+          2) 在前沿点->机场连线之间均匀布点。
+          3) 若仍不足，随机补足若干节点，保证距离不小于min_distance、不大于max_distance。
         """
-        # 1) Bounds
-        if x < self.x_min or x > self.x_max or y < self.y_min or y > self.y_max:
-            return False, self.reward_node_invalid, "Out of bounds"
 
-        # 2) Inside ADI inner zone?
-        for zone in self.adi_zones:
-            center = (zone['center_x'], zone['center_y'])
-            inner_radius = zone['radius']
-            if is_point_in_circle((x,y), (center, inner_radius)):
-                return False, self.reward_node_invalid, "Inside ADI inner zone"
+        # Start fresh
+        self.intermediate_nodes = []
+        self.intermediate_node_types = []
 
-        # 3) Too close to existing nodes
-        for node in self.fixed_nodes:
-            dist = np.sqrt((x - node[0])**2 + (y - node[1])**2)
-            if dist < self.min_distance:
-                return False, self.reward_node_invalid, "Too close to fixed node"
-        for node in self.intermediate_nodes:
-            dist = np.sqrt((x - node[0])**2 + (y - node[1])**2)
-            if dist < self.min_distance:
-                return False, self.reward_node_invalid, "Too close to intermediate node"
+        # Some references
+        frontline_points = self.frontline_points
+        airport_points = self.airport_points
+        fixed_nodes = self.fixed_nodes
+        adi_zones = self.adi_zones
 
-        # 4) Too far from any node
-        all_current_nodes = np.vstack([self.fixed_nodes, np.array(self.intermediate_nodes) if self.intermediate_nodes else np.zeros((0,2))])
-        min_dist_to_any = float('inf')
-        for node in all_current_nodes:
-            dist = np.sqrt((x - node[0])**2 + (y - node[1])**2)
-            if dist < min_dist_to_any:
-                min_dist_to_any = dist
-        if min_dist_to_any > self.max_distance:
-            return False, self.reward_node_invalid, "Too far from any node"
+        num_frontline = len(frontline_points)
+        num_airports = len(airport_points)
 
-        # 5) near ADI outer => extra reward
-        near_adi_outer = False
-        for zone in self.adi_zones:
+        # 1) Place around ADI outer ring
+        if self.log_level >= 2:
+            logger.info("[NodePlacementEnv] Step1: Place nodes near ADI outer ring.")
+        for zone_idx, zone in enumerate(adi_zones):
             center = (zone['center_x'], zone['center_y'])
             outer_radius = zone['epsilon']
             inner_radius = zone['radius']
-            dist_to_center = np.sqrt((x - center[0])**2 + (y - center[1])**2)
 
-            # Check if the node is near the outer edge
-            if abs(dist_to_center - outer_radius) < 20.0 and dist_to_center > inner_radius:
-                near_adi_outer = True
+            # We attempt ~6 nodes around each zone (tweak if needed)
+            num_points = min(6, max(1, self.max_nodes // max(1, len(adi_zones))))
+            angles = np.linspace(0, 2 * math.pi, num_points, endpoint=False)
+
+            for angle in angles:
+                # place ~5% outside the outer radius
+                dist = outer_radius * 1.05
+                x = center[0] + dist * math.cos(angle)
+                y = center[1] + dist * math.sin(angle)
+
+                if not self._valid_node(x, y, fixed_nodes, self.intermediate_nodes):
+                    continue
+
+                self.intermediate_nodes.append([x, y])
+                # normal intermediate => type=2
+                self.intermediate_node_types.append(2)
+
+                if len(self.intermediate_nodes) >= self.max_nodes:
+                    break
+            if len(self.intermediate_nodes) >= self.max_nodes:
                 break
 
-        # Basic reward for valid placement
-        reward = self.reward_node_valid
+        # 2) Place nodes along frontline->airport
+        if len(self.intermediate_nodes) < self.max_nodes:
+            if self.log_level >= 2:
+                logger.info("[NodePlacementEnv] Step2: Place nodes between frontline & airport pairs.")
 
-        # Extra reward for placing near ADI outer zone
-        if near_adi_outer:
-            reward += self.reward_node_near_adi
+            remaining = self.max_nodes - len(self.intermediate_nodes)
+            total_pairs = num_frontline * num_airports
+            if total_pairs > 0:
+                nodes_per_pair = max(1, remaining // total_pairs)
+            else:
+                nodes_per_pair = 1  # fallback
 
-        return True, reward, "Valid placement"
+            for f_idx in range(num_frontline):
+                for a_idx in range(num_airports):
+                    front = frontline_points[f_idx]
+                    airp = airport_points[a_idx]
+                    dx = airp[0] - front[0]
+                    dy = airp[1] - front[1]
 
-    def _is_outlier_region(self, x: float, y: float) -> bool:
-        """
-        Check if a point is in an outlier region.
+                    for i in range(nodes_per_pair):
+                        if len(self.intermediate_nodes) >= self.max_nodes:
+                            break
+                        ratio = (i + 1) / (nodes_per_pair + 1)
+                        x = front[0] + dx * ratio
+                        y = front[1] + dy * ratio
 
-        Args:
-            x: X-coordinate
-            y: Y-coordinate
+                        if not self._valid_node(x, y, fixed_nodes, self.intermediate_nodes):
+                            continue
 
-        Returns:
-            True if the point is in an outlier region, False otherwise
-        """
-        # Get all nodes
-        all_nodes = np.vstack([
-            self.fixed_nodes,
-            np.array(self.intermediate_nodes) if self.intermediate_nodes else np.zeros((0,2))
-        ])
-        dists = [np.sqrt((x - n[0])**2 + (y - n[1])**2) for n in all_nodes]
-        if len(dists) == 0:
-            return False
-        if min(dists) > 50.0:
-            return True
-        if np.mean(dists) > 100.0:
-            return True
-        return False
+                        # Let's pick type=3 in the middle, else 2
+                        if nodes_per_pair > 1 and i == nodes_per_pair // 2:
+                            node_type = 3
+                        else:
+                            node_type = 2
 
-    def _suggest_initial_nodes(self) -> np.ndarray:
-        """
-        Suggest initial node placements based on clustering.
+                        self.intermediate_nodes.append([x, y])
+                        self.intermediate_node_types.append(node_type)
 
-        Returns:
-            Array of suggested node coordinates
-        """
-        # Combine frontline and airport points for clustering
-        combined_points = np.vstack([self.frontline_points, self.airport_points])
+                    if len(self.intermediate_nodes) >= self.max_nodes:
+                        break
+                if len(self.intermediate_nodes) >= self.max_nodes:
+                    break
 
-        # Get suggested intermediate nodes
-        suggested_nodes = suggest_intermediate_nodes(
-            combined_points,
-            n_points=len(self.frontline_points),
-            max_intermediate_nodes=self.max_nodes,
-            isolation_threshold=100.0
-        )
+        # 3) random fallback if still not enough
+        if len(self.intermediate_nodes) < self.max_nodes:
+            if self.log_level >= 2:
+                logger.info("[NodePlacementEnv] Step3: random fallback for the rest.")
+            attempts = 0
+            max_attempts = 1000
+            while len(self.intermediate_nodes) < self.max_nodes and attempts < max_attempts:
+                attempts += 1
+                x = np.random.uniform(self.x_min, self.x_max)
+                y = np.random.uniform(self.y_min, self.y_max)
+
+                if not self._valid_node(x, y, fixed_nodes, self.intermediate_nodes):
+                    continue
+
+                # also check if too far from everything
+                if not self._within_max_range(x, y, fixed_nodes, self.intermediate_nodes):
+                    continue
+
+                self.intermediate_nodes.append([x, y])
+                self.intermediate_node_types.append(2)
+
         if self.log_level >= 2:
-            logger.info("[NodePlacementEnv] Generated %d suggested nodes via clustering.", len(suggested_nodes))
-        return suggested_nodes
+            logger.info("[NodePlacementEnv] Placed total %d intermediate nodes (limit=%d).",
+                        len(self.intermediate_nodes), self.max_nodes)
+
+    def _valid_node(self, x: float, y: float,
+                    fixed_nodes: np.ndarray,
+                    placed_nodes: List[List[float]]) -> bool:
+        """
+        Check if a candidate node is valid:
+          - Not inside any ADI inner circle
+          - Not within min_distance of existing nodes
+        """
+        # 1) not in ADI's inner zone
+        for z in self.adi_zones:
+            if is_point_in_circle((x, y), ((z['center_x'], z['center_y']), z['radius'])):
+                return False
+        # 2) not too close to any existing node
+        for node in fixed_nodes:
+            if distance_point_to_point((x, y), tuple(node)) < self.min_distance:
+                return False
+        for node in placed_nodes:
+            if distance_point_to_point((x, y), tuple(node)) < self.min_distance:
+                return False
+        return True
+
+    def _within_max_range(self, x: float, y: float,
+                          fixed_nodes: np.ndarray,
+                          placed_nodes: List[List[float]]) -> bool:
+        """
+        Check if the candidate node is not too far from EVERY existing node
+        (i.e. it must be within self.max_distance to at least one node).
+        """
+        found_close = False
+        # check fixed
+        for node in fixed_nodes:
+            if distance_point_to_point((x, y), tuple(node)) <= self.max_distance:
+                found_close = True
+                break
+        # check placed
+        if not found_close:
+            for node in placed_nodes:
+                if distance_point_to_point((x, y), tuple(node)) <= self.max_distance:
+                    found_close = True
+                    break
+        return found_close

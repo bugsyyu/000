@@ -39,6 +39,8 @@ class GraphConstructionEnv(gym.Env):
     1. 我们在 __init__ 中一次性固定离散动作空间的最大值（为所有可能边的上限），
        而不再在每个 step 或 reset 中动态修改 action_space。
     2. 当 done = True 后，打印每个前沿点-机场配对的连通性，为了方便直观查看最终是否全部连通。
+
+    另外：去掉了日志输出中的Unicode字符（例如“✅”和“❌”），防止在gbk编码环境下出错。
     """
 
     metadata = {'render.modes': ['human']}
@@ -87,7 +89,7 @@ class GraphConstructionEnv(gym.Env):
         self.action_space = spaces.Discrete(self.max_possible_edges)
 
         # ----- 构建 observation_space -----
-        unique_node_types = max(node_types) + 1
+        unique_node_types = max(node_types) + 1 if len(node_types) > 0 else 1
         node_feature_dim = 2 + unique_node_types + len(self.adi_zones)
         edge_feature_dim = 1 + len(self.adi_zones) + 1  # length + crossesADI + danger
 
@@ -127,7 +129,8 @@ class GraphConstructionEnv(gym.Env):
         self.reward_completion = 20.0
 
         if self.log_level >= 1:
-            logger.info("[GraphConstructionEnv] Initialized with %d nodes, max_edges=%d", self.num_nodes, self.max_edges)
+            logger.info("[GraphConstructionEnv] Initialized with %d nodes, max_edges=%d",
+                        self.num_nodes, self.max_edges)
 
     def reset(self, seed: Optional[int] = None, options: Optional[Dict] = None):
         if seed is not None:
@@ -138,7 +141,8 @@ class GraphConstructionEnv(gym.Env):
 
         obs = self._get_observation()
         if self.log_level >= 2:
-            logger.info("[GraphConstructionEnv] Reset. Potential edges count=%d", len(self.valid_potential_edges))
+            logger.info("[GraphConstructionEnv] Reset. Potential edges count=%d",
+                        len(self.valid_potential_edges))
         return obs, {}
 
     def step(self, action: int):
@@ -220,7 +224,6 @@ class GraphConstructionEnv(gym.Env):
 
         # 如果 done=True，打印每个前沿点-机场对是否连通，方便最直观判断
         if done:
-            # print connectivity
             all_paths, success_flags = find_shortest_paths(
                 self.nodes,
                 self.edges,
@@ -237,11 +240,11 @@ class GraphConstructionEnv(gym.Env):
                     if self.log_level >= 2:
                         logger.info("   Pair(frontline=%d, airport=%d): %s", f, a, status)
                     idx += 1
-                # end for
+
             if num_connected_pairs == total_pairs and self.log_level >= 2:
-                logger.info("=> All pairs are connected! ✅")
+                logger.info("=> All pairs are connected! [OK]")
             elif self.log_level >= 2:
-                logger.info("=> Not all pairs connected. (connected %d/%d) ❌",
+                logger.info("=> Not all pairs connected. (connected %d/%d) [X]",
                             num_connected_pairs, total_pairs)
 
         return obs, reward, done, False, info
