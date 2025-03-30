@@ -1,5 +1,6 @@
 """
-Simplified training script for quick testing of the airspace network planning system.
+Simplified training script for quick testing of the airspace network planning system,
+with logs now directed to both console and a dedicated file.
 """
 
 import logging
@@ -175,7 +176,6 @@ def create_edges_manually(nodes: np.ndarray, node_types: List[int], cartesian_co
         # Connect to K nearest neighbors
         for k in range(min(K, len(distances))):
             _, idx2 = distances[k]
-
             # Create edge (if not already exists)
             if (idx1, idx2) not in edges and (idx2, idx1) not in edges:
                 edges.append((idx1, idx2))
@@ -256,18 +256,29 @@ def main():
     parser.add_argument('--log_level', type=int, default=2, help='Logging verbosity level (1=minimal,2=info,3=debug)')
 
     args = parser.parse_args()
+
+    # Determine logging level
+    # level = logging.DEBUG if args.log_level >= 3 else (logging.INFO if args.log_level == 2 else logging.WARNING)
+    level = logging.INFO
+    # Ensure output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Set up log file path
+    log_file = os.path.join(args.output_dir, 'train_quick.log')
+
+    # Configure logging to file + console
     logging.basicConfig(
-        # level=logging.DEBUG if args.log_level >= 3 else (logging.INFO if args.log_level == 2 else logging.WARNING),
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+        level=level,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, mode='w'),
+            logging.StreamHandler()
+        ]
     )
 
     # Set random seed
     random.seed(args.seed)
     np.random.seed(args.seed)
-
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
 
     logger.info("Starting quick test of airspace network planning...")
 
@@ -355,6 +366,7 @@ def main():
     logger.info("Quick test completed. Results saved to %s", args.output_dir)
     logger.info("To evaluate the full network, run: python evaluate.py --input_file %s/quick_network.npz --output_dir %s/evaluation",
                 args.output_dir, args.output_dir)
+
 
 if __name__ == '__main__':
     main()

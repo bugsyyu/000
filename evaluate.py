@@ -1,5 +1,7 @@
 """
 Evaluation script for the airspace network planning system.
+
+Now logs are also directed to a dedicated file.
 """
 
 import os
@@ -223,6 +225,7 @@ def evaluate_network_plan(
 
     logger.info("[evaluate.py] Evaluation results saved to %s", output_dir)
 
+
 def main():
     """
     Main function to run the evaluation process.
@@ -233,9 +236,25 @@ def main():
     parser.add_argument('--log_level', type=int, default=2, help='Logging verbosity (1=minimal,2=info,3=debug)')
 
     args = parser.parse_args()
+
+    # Ensure output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Determine logging level
+    # level = logging.DEBUG if args.log_level >= 3 else (logging.INFO if args.log_level == 2 else logging.WARNING)
+    level = logging.INFO
+
+    # Set up log file path
+    log_file = os.path.join(args.output_dir, 'evaluate.log')
+
+    # Configure logging to file + console
     logging.basicConfig(
-        level=logging.DEBUG if args.log_level >= 3 else (logging.INFO if args.log_level == 2 else logging.WARNING),
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+        level=level,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, mode='w'),
+            logging.StreamHandler()
+        ]
     )
 
     # Load network data
@@ -254,6 +273,7 @@ def main():
     evaluate_network_plan(nodes, node_types, edges, cartesian_config, args.output_dir)
 
     logger.info("Evaluation results saved to %s", args.output_dir)
+
 
 if __name__ == '__main__':
     main()

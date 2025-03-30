@@ -5,7 +5,7 @@ We define a CustomLoggingCallback to control:
 - log_level=1: minimal logs (episodes overall)
 - log_level=2: per-episode logs
 - log_level=3: per-step logs
-And we use Python logging instead of print.
+And we use Python logging instead of print, now also configured to output to a dedicated log file.
 """
 
 import logging
@@ -30,6 +30,7 @@ from utils.visualization import plot_airspace_network, plot_training_progress
 from environment.utils import evaluate_network, find_shortest_paths
 
 logger = logging.getLogger(__name__)
+
 # ------------------- Custom callback with log_level -------------------
 class CustomLoggingCallback(BaseCallback):
     """
@@ -120,7 +121,6 @@ class CustomLoggingCallback(BaseCallback):
         """
         pass  # you could replicate the logic in the old trainingprogresscallback
 
-
     def _on_training_end(self) -> None:
         if self.log_level >= 1:
             logger.info("[CustomLoggingCallback] Training ended. Total episodes finished: %d", self.episode_count)
@@ -158,6 +158,7 @@ def train_node_placement(
         seed: Random seed
         max_nodes: Maximum number of intermediate nodes
         total_timesteps: Total number of timesteps to train for
+        log_level: Logging verbosity level (1= minimal, 2= info, 3= debug)
 
     Returns:
         Tuple of (trained model, tuple of (nodes, node_types))
@@ -329,6 +330,7 @@ def train_node_placement(
 
     return model, (final_nodes, final_node_types)
 
+
 # ------------------- Graph construction training function -------------------
 def train_graph_construction(
     cartesian_config: Dict[str, Any],
@@ -365,6 +367,7 @@ def train_graph_construction(
         seed: Random seed
         max_edges: Maximum number of edges
         total_timesteps: Total number of timesteps to train for
+        log_level: Logging verbosity level
 
     Returns:
         Tuple of (trained model, list of edges)
@@ -571,6 +574,7 @@ def train_graph_construction(
 
     return model, final_edges
 
+
 def main():
     """
     Main function to run the training process.
@@ -588,11 +592,21 @@ def main():
 
     args = parser.parse_args()
 
-    # Example of configuring the root logger
+    # Determine logging level
+    # level = logging.DEBUG if args.log_level >= 3 else (logging.INFO if args.log_level == 2 else logging.WARNING)
+    level = logging.INFO
+    # Set up log file path
+    os.makedirs(args.output_dir, exist_ok=True)
+    log_file = os.path.join(args.output_dir, 'train.log')
+
+    # Configure logging to file + console
     logging.basicConfig(
-        level=logging.INFO,
-        # level=logging.DEBUG if args.log_level >= 3 else (logging.INFO if args.log_level == 2 else logging.WARNING),
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+        level=level,
+        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, mode='w'),
+            logging.StreamHandler()
+        ]
     )
 
     # Transform latitude-longitude config to Cartesian coordinates
@@ -636,6 +650,7 @@ def main():
         edges=np.array(edges)
     )
     logger.info("Final results saved to %s", os.path.join(args.output_dir, 'final_network.npz'))
+
 
 if __name__ == '__main__':
     main()
