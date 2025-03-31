@@ -230,10 +230,10 @@ def test_environment(nodes: np.ndarray, node_types: List[int], cartesian_config:
     for i in range(max_steps):
         # Sample a random action
         action = env.action_space.sample()
-        logger.debug("Step %d: Taking action %s", i+1, action)
+        logger.info("Step %d: Taking action %s", i+1, action)
         # Take step
         obs, reward, done, _, info = env.step(action)
-        logger.debug("  Reward: %.3f, Done=%s, Info=%s", reward, done, info)
+        logger.info("  Reward: %.3f, Done=%s, Info=%s", reward, done, info)
         if done:
             logger.info("Environment done at step %d.", i+1)
             break

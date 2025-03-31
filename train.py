@@ -9,9 +9,11 @@ We define a CustomLoggingCallback to control:
 And we use Python logging instead of print, also configured to output to a dedicated log file.
 
 IMPORTANT FIX:
-- Removed all unicode emojis (✅, ❌) in logs to avoid gbk encoding error on Windows.
+- Removed all unicode emojis (like ✅, ❌) in logs to avoid gbk encoding error on Windows.
 - We add --node_n_steps and --graph_n_steps to override the default n_steps=2048, so that
   if your environment ends in 1 step, you won't be forced to run 2048 episodes per update.
+- Added logic to allow continuing training from a pretrained model. You can pass
+  --node_pretrained_model or --graph_pretrained_model to specify a previous .zip model file.
 """
 
 import logging
@@ -20,7 +22,7 @@ import argparse
 import numpy as np
 import torch
 import random
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
@@ -36,6 +38,7 @@ from utils.visualization import plot_airspace_network, plot_training_progress
 from environment.utils import evaluate_network, find_shortest_paths
 
 logger = logging.getLogger(__name__)
+
 
 # ------------------- Custom callback with log_level -------------------
 class CustomLoggingCallback(BaseCallback):
@@ -92,7 +95,7 @@ class CustomLoggingCallback(BaseCallback):
         self.current_episode_length += 1
         if self.log_level >= 3:
             # Step-level logs
-            logger.debug("[log_level=3][Step] Episode %d Step %d Action=%s Reward=%.3f Done=%s",
+            logger.info("[log_level=3][Step] Episode %d Step %d Action=%s Reward=%.3f Done=%s",
                          self.episode_count, self.current_episode_length, str(a), r, d)
         if d:
             self.episode_rewards.append(self.current_episode_reward)
@@ -136,7 +139,7 @@ def train_node_placement(
     cartesian_config: Dict[str, Any],
     output_dir: str,
     n_envs: int = 4,
-    n_steps: int = 2048,  # <--- We can now pass a smaller number to avoid 2048 episodes
+    n_steps: int = 2048,
     batch_size: int = 64,
     n_epochs: int = 10,
     learning_rate: float = 3e-4,
@@ -145,10 +148,11 @@ def train_node_placement(
     seed: int = 42,
     max_nodes: int = 30,
     total_timesteps: int = 1000000,
-    log_level: int = 1
+    log_level: int = 1,
+    pretrained_model_path: Optional[str] = None
 ) -> Tuple[PPO, Tuple[np.ndarray, List[int]]]:
     """
-    Train the node placement model.
+    Train (or continue training) the node placement model.
 
     Args:
         cartesian_config: Configuration with Cartesian coordinates
@@ -164,6 +168,7 @@ def train_node_placement(
         max_nodes: Maximum number of intermediate nodes
         total_timesteps: Total number of timesteps to train for
         log_level: Logging verbosity level (1= minimal, 2= info, 3= debug)
+        pretrained_model_path: If provided, load a pretrained model from this path and continue training.
 
     Returns:
         Tuple of (trained model, tuple of (nodes, node_types))
@@ -205,25 +210,36 @@ def train_node_placement(
         name_prefix='node_placement_model'
     )
 
-    # Create and train model, overriding n_steps
-    model = PPO(
-        'MlpPolicy',
-        env,
-        learning_rate=learning_rate,
-        n_steps=n_steps,          # <=== KEY: override from argument
-        batch_size=batch_size,
-        n_epochs=n_epochs,
-        gamma=gamma,
-        verbose=1,  # stable-baselines internal verbosity
-        device=device,
-        seed=seed
-    )
+    # Decide whether to load a pretrained model or create a new one
+    if pretrained_model_path and os.path.isfile(pretrained_model_path):
+        logger.info("Loading pretrained node placement model from: %s", pretrained_model_path)
+        model = PPO.load(pretrained_model_path, env=env, device=device)
+        model.set_env(env)
+        reset_num_timesteps = False
+    else:
+        logger.info("No valid pretrained node placement model specified. Creating a new model.")
+        model = PPO(
+            'MlpPolicy',
+            env,
+            learning_rate=learning_rate,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
+            gamma=gamma,
+            verbose=1,  # stable-baselines internal verbosity
+            device=device,
+            seed=seed
+        )
+        reset_num_timesteps = True
 
     logger.info("Starting NodePlacementEnv training with total_timesteps=%d and n_steps=%d ...",
                 total_timesteps, n_steps)
+
+    # Train (or continue training)
     model.learn(
         total_timesteps=total_timesteps,
-        callback=[custom_log_callback, checkpoint_callback]
+        callback=[custom_log_callback, checkpoint_callback],
+        reset_num_timesteps=reset_num_timesteps
     )
 
     # Save final model
@@ -288,7 +304,7 @@ def train_graph_construction(
     node_types: List[int],
     output_dir: str,
     n_envs: int = 1,
-    n_steps: int = 2048,  # <=== again, we allow override
+    n_steps: int = 2048,
     batch_size: int = 64,
     n_epochs: int = 10,
     learning_rate: float = 3e-4,
@@ -297,10 +313,11 @@ def train_graph_construction(
     seed: int = 42,
     max_edges: int = 100,
     total_timesteps: int = 1000000,
-    log_level: int = 1
+    log_level: int = 1,
+    pretrained_model_path: Optional[str] = None
 ) -> Tuple[PPO, List[Tuple[int, int]]]:
     """
-    Train the graph construction model.
+    Train (or continue training) the graph construction model.
     """
     set_random_seed(seed)
 
@@ -310,6 +327,7 @@ def train_graph_construction(
     frontline_indices = [i for i, t in enumerate(node_types) if t == 0]
     airport_indices = [i for i, t in enumerate(node_types) if t == 1]
 
+    # Just a quick check env
     test_env = GraphConstructionEnv(
         nodes=nodes,
         node_types=node_types,
@@ -352,24 +370,35 @@ def train_graph_construction(
         name_prefix='graph_construction_model'
     )
 
-    model = PPO(
-        'MultiInputPolicy',
-        env,
-        learning_rate=learning_rate,
-        n_steps=n_steps,  # <=== override from argument
-        batch_size=batch_size,
-        n_epochs=n_epochs,
-        gamma=gamma,
-        verbose=1,
-        device=device,
-        seed=seed
-    )
+    # Decide whether to load a pretrained model or create a new one
+    if pretrained_model_path and os.path.isfile(pretrained_model_path):
+        logger.info("Loading pretrained graph construction model from: %s", pretrained_model_path)
+        model = PPO.load(pretrained_model_path, env=env, device=device)
+        model.set_env(env)
+        reset_num_timesteps = False
+    else:
+        logger.info("No valid pretrained graph construction model specified. Creating a new model.")
+        model = PPO(
+            'MultiInputPolicy',
+            env,
+            learning_rate=learning_rate,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            n_epochs=n_epochs,
+            gamma=gamma,
+            verbose=1,
+            device=device,
+            seed=seed
+        )
+        reset_num_timesteps = True
 
     logger.info("Starting GraphConstructionEnv training with total_timesteps=%d and n_steps=%d ...",
                 total_timesteps, n_steps)
+
     model.learn(
         total_timesteps=total_timesteps,
-        callback=[custom_log_callback, checkpoint_callback]
+        callback=[custom_log_callback, checkpoint_callback],
+        reset_num_timesteps=reset_num_timesteps
     )
 
     model.save(os.path.join(output_dir, 'graph_construction', 'final_model'))
@@ -489,14 +518,26 @@ def main():
     parser.add_argument('--max_edges', type=int, default=100, help='Maximum number of edges')
     parser.add_argument('--n_envs', type=int, default=4, help='Number of parallel environments for node placement')
     parser.add_argument('--log_level', type=int, default=1, help='Logging verbosity level (1=min,2=info,3=debug)')
-
-    # NEW: let user override PPO n_steps for node & graph
     parser.add_argument('--node_n_steps', type=int, default=8, help='Number of steps per rollout in node_env PPO')
     parser.add_argument('--graph_n_steps', type=int, default=2048, help='Number of steps per rollout in graph_env PPO')
 
+    # New arguments for continuing training from pretrained models
+    parser.add_argument('--node_pretrained_model', type=str, default=None,
+                        help='Path to a pretrained node placement model to continue training from (a .zip file).')
+    parser.add_argument('--graph_pretrained_model', type=str, default=None,
+                        help='Path to a pretrained graph construction model to continue training from (a .zip file).')
+
     args = parser.parse_args()
 
-    level = logging.INFO
+    # Determine logging level based on log_level argument
+    if args.log_level >= 3:
+        # level = logging.DEBUG
+        level = logging.INFO
+    elif args.log_level == 2:
+        level = logging.INFO
+    else:
+        level = logging.WARNING
+
     os.makedirs(args.output_dir, exist_ok=True)
     log_file = os.path.join(args.output_dir, 'train.log')
     logging.basicConfig(
@@ -521,8 +562,8 @@ def main():
         total_timesteps=args.node_timesteps,
         n_envs=args.n_envs,
         log_level=args.log_level,
-        # override n_steps for node env
-        n_steps=args.node_n_steps
+        n_steps=args.node_n_steps,
+        pretrained_model_path=args.node_pretrained_model
     )
     logger.info("Node placement complete. Generated %d nodes.", len(nodes))
 
@@ -539,8 +580,8 @@ def main():
         total_timesteps=args.graph_timesteps,
         n_envs=1,  # typically we do 1 env for graph, but could do more
         log_level=args.log_level,
-        # override n_steps for graph env
-        n_steps=args.graph_n_steps
+        n_steps=args.graph_n_steps,
+        pretrained_model_path=args.graph_pretrained_model
     )
     logger.info("Graph construction complete. Generated %d edges.", len(edges))
 

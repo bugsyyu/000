@@ -1,12 +1,31 @@
 """
 Node placement environment (simplified) with improved "strategic" node placement logic.
 
-这里在 reset() 时基于借鉴的“改进节点放置算法”一次性确定所有中间节点，
+本文件原先的做法是：在 reset() 时基于借鉴的“改进节点放置算法”一次性确定所有中间节点，
 然后在 step() 中直接返回 done=True，不再进行深度强化学习式的逐步搜索。
 这样可快速完成节点放置，并避免反复采样造成的大量无效动作。
 
-具体逻辑写在 _place_nodes_geometrically() 中，
-参考了此前给出的“place_strategic_nodes”思路，并做了适配与简化。
+原先的做法是通过 KMeans 将前沿点和机场点各聚为若干类，然后对聚类中心进行合并求几何中心。
+此方法比较粗糙，容易产生未充分利用的节点或过多冗余节点，且无法灵活应对多条前沿与机场之间
+通过节点灵活调度的需要。
+
+这里我们设计一个全新的、简单但更有效的算法来放置节点，以便后续连线阶段可以有更好的连接潜力：
+
+新算法（“前沿-机场对 midpoints + 去重 + 过滤”）：
+
+1) 收集所有前沿点(frontline_points)和机场(airport_points)。
+2) 对于每一个前沿点 f 和机场点 a，计算它们的中点 mid = (f + a)/2。
+   - 如果该 mid 处在ADI内圈、机场禁飞圈(20km)、危险区等禁区，则忽略。
+   - 如果该 mid 与已有节点（固定或已放置）距离小于 min_distance，则忽略。
+3) 将所有合法 midpoints 收集起来，如此会得到 (N_frontline * N_airport) 个候选点，实际可能少于此数量因为某些点位无效或被过滤。
+4) 如果最终候选数超过 max_nodes，则用一次 KMeans(n_clusters=max_nodes) 将候选点压缩成 max_nodes 个中心。
+   这里的 KMeans 仅作为一个简单降维手段；若不想依赖外部库或想使用其他压缩策略也可。
+5) 将这些中心点（或未超限时的所有 midpoints）作为中间节点，node_type=2。
+6) 全部一次性放置到 intermediate_nodes 里完成。
+
+注意：此方法非常直观：基本思路是让每条“前沿-机场”直线的中部形成一个可被后续连线利用的节点，如果该节点在禁区就跳过。如果数量太多，则用简单聚类合并一下。
+
+这样可以比过去那种对前沿/机场分别聚类再两两合并求中心，更容易保证节点对潜在多条连接有价值，并能兼顾到多对前沿-机场可能形成的庞大连线需求。
 """
 
 import logging
@@ -21,29 +40,29 @@ import math
 # Add parent directory to path (so we can import from ../utils if needed)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.geometry import is_point_in_circle, distance_point_to_point
+from utils.geometry import (
+    is_point_in_circle,
+    distance_point_to_point
+)
+
+# ========== 依赖KMeans用于必要时降到 max_nodes ==========
+from sklearn.cluster import KMeans
+
 
 logger = logging.getLogger(__name__)
 
 class NodePlacementEnv(gym.Env):
     """
-    Environment for placing intermediate nodes with an improved deterministic strategy
-    (rather than random RL exploration).
-
-    Use-cases:
-      - If you prefer a guaranteed geometric approach to place nodes between frontlines and airports,
-        near ADI outer rings, and in some random fallback, you can do so here.
-      - We unify everything into the reset() method => once environment is reset, all nodes are placed.
-      - Then step() just returns done=True, effectively skipping multi-step RL.
+    Environment for placing intermediate nodes with an improved deterministic strategy.
 
     Node Types:
       0: frontline
       1: airport
       2: normal intermediate
-      3: special intermediate
+      3: special intermediate (本版本同样不会区分特殊节点, 一律用2)
 
-    Basic usage remains the same as the old RL environment. But effectively
-    the "training" on this env will finish quickly since there's no multi-step flow.
+    当前设计：一旦reset()时就一次性放置所有中间节点，然后在step()里直接返回done=True，
+    不执行多步操作。这样可以简化流程并与后续GraphConstructionEnv对接。
     """
 
     metadata = {'render.modes': ['human']}
@@ -91,17 +110,18 @@ class NodePlacementEnv(gym.Env):
         self.x_min, self.x_max = x_min - padding, x_max + padding
         self.y_min, self.y_max = y_min - padding, y_max + padding
 
+        # Zones
         self.adi_zones = cartesian_config['adi_zones']
         self.danger_zones = cartesian_config['danger_zones']
 
-        # Action space: still a 3D Box for (x,y,node_type), but effectively unused
+        # Action space: 仍然保留3D，但实际上不使用
         self.action_space = spaces.Box(
             low=np.array([self.x_min, self.y_min, 0]),
             high=np.array([self.x_max, self.y_max, 1]),
             dtype=np.float32
         )
 
-        # We keep the same shape for observation as the old approach, for SB3 compatibility
+        # 保持与之前相同的 observation shape 以兼容性
         num_adi_zones = len(self.adi_zones)
         obs_size = (self.num_fixed_nodes * 3) + (max_nodes * 3) + (num_adi_zones * 4) + 1
         self.observation_space = spaces.Box(
@@ -117,7 +137,7 @@ class NodePlacementEnv(gym.Env):
 
         if self.log_level >= 1:
             logger.info(
-                "[NodePlacementEnv] Using a strategic deterministic placement approach. "
+                "[NodePlacementEnv] Using new midpoint-based approach for node placement. "
                 "max_nodes=%d, min_distance=%.1f, max_distance=%.1f",
                 self.max_nodes, self.min_distance, self.max_distance
             )
@@ -126,10 +146,10 @@ class NodePlacementEnv(gym.Env):
         if seed is not None:
             np.random.seed(seed)
 
-        # Perform the strategic/deterministic node placement
-        self._place_nodes_geometrically()
+        # 这里进行一次性放置节点
+        self._place_nodes_midpoint_based()
 
-        # We'll consider that we've placed all nodes at once
+        # 我们已经放置完节点，不需要多余step
         self.remaining_nodes = 0
 
         obs = self._get_observation()
@@ -142,7 +162,7 @@ class NodePlacementEnv(gym.Env):
 
     def step(self, action):
         """
-        We skip step-by-step logic: immediately done.
+        直接done，不进行多步放置。
         """
         obs = self._get_observation()
         reward = 0.0
@@ -164,7 +184,7 @@ class NodePlacementEnv(gym.Env):
           0: frontline
           1: airport
           2: normal intermediate
-          3: special intermediate
+          3: special intermediate (统一=2)
         """
         all_nodes = np.vstack([
             self.fixed_nodes,
@@ -182,7 +202,7 @@ class NodePlacementEnv(gym.Env):
 
     def _get_observation(self) -> np.ndarray:
         """
-        Flatten everything to match the old observation shape.
+        Flatten everything to match old observation shape.
         """
         fixed_obs = np.zeros((self.num_fixed_nodes, 3))
         num_frontline = len(self.frontline_points)
@@ -216,165 +236,143 @@ class NodePlacementEnv(gym.Env):
         ]).astype(np.float32)
         return obs
 
-    def _place_nodes_geometrically(self):
+    def _place_nodes_midpoint_based(self):
         """
-        Core logic for strategic deterministic placement.
-
-        参考了 `place_strategic_nodes()` 的思路:
-          1) 在 ADI 外圈附近放置一批节点。
-          2) 在前沿点->机场连线之间均匀布点。
-          3) 若仍不足，随机补足若干节点，保证距离不小于min_distance、不大于max_distance。
+        使用“前沿-机场对”中点的思路放置中间节点：
+          1) 遍历所有 (frontline, airport) 对，求中点
+          2) 如果该中点不在ADI内圈/机场禁飞圈/危险区内，且与已有节点距离>=min_distance，则保留
+          3) 如果候选节点数量 > max_nodes，用KMeans聚成 max_nodes个
+          4) 放入 self.intermediate_nodes，node_type=2
         """
 
-        # Start fresh
         self.intermediate_nodes = []
         self.intermediate_node_types = []
 
-        # Some references
-        frontline_points = self.frontline_points
-        airport_points = self.airport_points
-        fixed_nodes = self.fixed_nodes
-        adi_zones = self.adi_zones
+        if len(self.frontline_points) == 0 or len(self.airport_points) == 0:
+            if self.log_level >= 2:
+                logger.info("[NodePlacementEnv] No frontline or airport points => no intermediate nodes.")
+            return
 
-        num_frontline = len(frontline_points)
-        num_airports = len(airport_points)
-
-        # 1) Place around ADI outer ring
-        if self.log_level >= 2:
-            logger.info("[NodePlacementEnv] Step1: Place nodes near ADI outer ring.")
-        for zone_idx, zone in enumerate(adi_zones):
-            center = (zone['center_x'], zone['center_y'])
-            outer_radius = zone['epsilon']
-            inner_radius = zone['radius']
-
-            # We attempt ~6 nodes around each zone (tweak if needed)
-            num_points = min(6, max(1, self.max_nodes // max(1, len(adi_zones))))
-            angles = np.linspace(0, 2 * math.pi, num_points, endpoint=False)
-
-            for angle in angles:
-                # place ~5% outside the outer radius
-                dist = outer_radius * 1.05
-                x = center[0] + dist * math.cos(angle)
-                y = center[1] + dist * math.sin(angle)
-
-                if not self._valid_node(x, y, fixed_nodes, self.intermediate_nodes):
+        candidate_points = []
+        # 1) 生成候选中点
+        for f_pt in self.frontline_points:
+            for a_pt in self.airport_points:
+                mid_x = 0.5 * (f_pt[0] + a_pt[0])
+                mid_y = 0.5 * (f_pt[1] + a_pt[1])
+                if not self._valid_node(mid_x, mid_y, self.fixed_nodes, candidate_points):
                     continue
+                # 先暂时收集，不立即加到candidate_points里，因为要统一判距离
+                candidate_points.append([mid_x, mid_y])
 
-                self.intermediate_nodes.append([x, y])
-                # normal intermediate => type=2
-                self.intermediate_node_types.append(2)
+        if len(candidate_points) == 0:
+            # 没有可用的中点
+            if self.log_level >= 2:
+                logger.info("[NodePlacementEnv] No valid midpoints found.")
+            return
 
-                if len(self.intermediate_nodes) >= self.max_nodes:
-                    break
-            if len(self.intermediate_nodes) >= self.max_nodes:
+        # 2) 去重(防止坐标几乎完全相同)
+        unique_candidates = self._deduplicate_points(candidate_points)
+
+        # 3) 如果数量超限，用 KMeans 压缩到 max_nodes
+        if len(unique_candidates) > self.max_nodes:
+            kmeans = KMeans(n_clusters=self.max_nodes, random_state=42)
+            kmeans.fit(unique_candidates)
+            final_centers = kmeans.cluster_centers_
+        else:
+            final_centers = np.array(unique_candidates)
+
+        # 4) 将压缩或原始的节点纳入 intermediate_nodes
+        #    但仍需对每个中心做一次 _valid_node 检查（可能因相互距离等因素）
+        placed_count = 0
+        placed_nodes = []
+
+        for pt in final_centers:
+            x, y = pt
+            if not self._valid_node(x, y, self.fixed_nodes, placed_nodes):
+                continue
+            placed_nodes.append([x, y])
+            placed_count += 1
+            if placed_count >= self.max_nodes:
                 break
 
-        # 2) Place nodes along frontline->airport
-        if len(self.intermediate_nodes) < self.max_nodes:
-            if self.log_level >= 2:
-                logger.info("[NodePlacementEnv] Step2: Place nodes between frontline & airport pairs.")
-
-            remaining = self.max_nodes - len(self.intermediate_nodes)
-            total_pairs = num_frontline * num_airports
-            if total_pairs > 0:
-                nodes_per_pair = max(1, remaining // total_pairs)
-            else:
-                nodes_per_pair = 1  # fallback
-
-            for f_idx in range(num_frontline):
-                for a_idx in range(num_airports):
-                    front = frontline_points[f_idx]
-                    airp = airport_points[a_idx]
-                    dx = airp[0] - front[0]
-                    dy = airp[1] - front[1]
-
-                    for i in range(nodes_per_pair):
-                        if len(self.intermediate_nodes) >= self.max_nodes:
-                            break
-                        ratio = (i + 1) / (nodes_per_pair + 1)
-                        x = front[0] + dx * ratio
-                        y = front[1] + dy * ratio
-
-                        if not self._valid_node(x, y, fixed_nodes, self.intermediate_nodes):
-                            continue
-
-                        # Let's pick type=3 in the middle, else 2
-                        if nodes_per_pair > 1 and i == nodes_per_pair // 2:
-                            node_type = 3
-                        else:
-                            node_type = 2
-
-                        self.intermediate_nodes.append([x, y])
-                        self.intermediate_node_types.append(node_type)
-
-                    if len(self.intermediate_nodes) >= self.max_nodes:
-                        break
-                if len(self.intermediate_nodes) >= self.max_nodes:
-                    break
-
-        # 3) random fallback if still not enough
-        if len(self.intermediate_nodes) < self.max_nodes:
-            if self.log_level >= 2:
-                logger.info("[NodePlacementEnv] Step3: random fallback for the rest.")
-            attempts = 0
-            max_attempts = 1000
-            while len(self.intermediate_nodes) < self.max_nodes and attempts < max_attempts:
-                attempts += 1
-                x = np.random.uniform(self.x_min, self.x_max)
-                y = np.random.uniform(self.y_min, self.y_max)
-
-                if not self._valid_node(x, y, fixed_nodes, self.intermediate_nodes):
-                    continue
-
-                # also check if too far from everything
-                if not self._within_max_range(x, y, fixed_nodes, self.intermediate_nodes):
-                    continue
-
-                self.intermediate_nodes.append([x, y])
-                self.intermediate_node_types.append(2)
+        # 记录
+        self.intermediate_nodes = placed_nodes
+        self.intermediate_node_types = [2]*len(self.intermediate_nodes)
 
         if self.log_level >= 2:
-            logger.info("[NodePlacementEnv] Placed total %d intermediate nodes (limit=%d).",
+            logger.info("[NodePlacementEnv] _place_nodes_midpoint_based => final placed %d nodes (limit=%d).",
                         len(self.intermediate_nodes), self.max_nodes)
+
+    def _deduplicate_points(self, points: List[List[float]], eps: float = 1.0) -> List[List[float]]:
+        """
+        对候选点进行简单去重，如果两点距离<eps则视为同一个点，仅保留一个。
+        这里 eps=1.0km，可自行调整。
+        """
+        unique_points = []
+        for p in points:
+            if not unique_points:
+                unique_points.append(p)
+                continue
+            # check if p is near any
+            too_close = False
+            for q in unique_points:
+                if distance_point_to_point(p, q) < eps:
+                    too_close = True
+                    break
+            if not too_close:
+                unique_points.append(p)
+        return unique_points
 
     def _valid_node(self, x: float, y: float,
                     fixed_nodes: np.ndarray,
                     placed_nodes: List[List[float]]) -> bool:
         """
         Check if a candidate node is valid:
-          - Not inside any ADI inner circle
-          - Not within min_distance of existing nodes
+          1) 不在任何ADI内圈
+          2) 不在任何机场20km禁飞区
+          3) 不在任何危险区圆内
+          4) 与所有已存在节点(含固定与中间)的距离 >= self.min_distance
+          5) 距离至少与已有节点中任意一个 <= self.max_distance(否则没意义，离所有节点都太远)
         """
-        # 1) not in ADI's inner zone
+
+        # 1) 不在ADI内圈
         for z in self.adi_zones:
             if is_point_in_circle((x, y), ((z['center_x'], z['center_y']), z['radius'])):
                 return False
-        # 2) not too close to any existing node
+
+        # 2) 不在机场20km禁飞区
+        for a in self.cartesian_config['airports']:
+            dist_airport = distance_point_to_point((x, y), (a['x'], a['y']))
+            if dist_airport < 20.0:
+                return False
+
+        # 3) 不在危险区圆内
+        for d in self.danger_zones:
+            dist_danger = distance_point_to_point((x, y), (d['center_x'], d['center_y']))
+            if dist_danger <= d['radius']:
+                return False
+
+        # 4) min_distance
         for node in fixed_nodes:
             if distance_point_to_point((x, y), tuple(node)) < self.min_distance:
                 return False
         for node in placed_nodes:
             if distance_point_to_point((x, y), tuple(node)) < self.min_distance:
                 return False
-        return True
 
-    def _within_max_range(self, x: float, y: float,
-                          fixed_nodes: np.ndarray,
-                          placed_nodes: List[List[float]]) -> bool:
-        """
-        Check if the candidate node is not too far from EVERY existing node
-        (i.e. it must be within self.max_distance to at least one node).
-        """
-        found_close = False
-        # check fixed
+        # 5) 需要离“至少一个已存在节点”不超过 self.max_distance (如果都太远就没什么意义)
+        #    - 也可以认为只要与所有点均>max_distance就无意义
+        all_too_far = True
         for node in fixed_nodes:
             if distance_point_to_point((x, y), tuple(node)) <= self.max_distance:
-                found_close = True
+                all_too_far = False
                 break
-        # check placed
-        if not found_close:
+        if all_too_far:
             for node in placed_nodes:
                 if distance_point_to_point((x, y), tuple(node)) <= self.max_distance:
-                    found_close = True
+                    all_too_far = False
                     break
-        return found_close
+        if all_too_far:
+            return False
+
+        return True
