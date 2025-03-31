@@ -1,4 +1,4 @@
-# airspace_netword_planning
+# airspace_network_planning
 # 空间路网规划项目使用指南
 
 本项目使用强化学习来规划空中通道网络，满足内径避开、外径穿越、转角控制等多种约束。
